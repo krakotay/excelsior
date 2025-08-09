@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "excelsior"
-version = "0.9.1-a1"
+version = "0.10.0-a1"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "rust-core"
-version = "0.9.1-a1"
+version = "0.10.0-a1"
 dependencies = [
  "anyhow",
  "lexical-core",

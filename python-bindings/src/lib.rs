@@ -36,13 +36,12 @@ struct PyVertAlignment(VertAlignment);
 #[derive(Clone)]
 struct PyAlignSpec(AlignSpec);
 
-
 #[pymethods]
 impl PyAlignSpec {
     #[new]
     #[pyo3(signature = (horiz = None, vert = None, wrap = false))]
     fn new(
-        py: Python<'_>, // <--- Запрашиваем доступ к GIL
+        py: Python<'_>,          // <--- Запрашиваем доступ к GIL
         horiz: Option<PyObject>, // <--- Принимаем PyObject
         vert: Option<PyObject>,  // <--- Принимаем PyObject
         wrap: bool,
@@ -70,7 +69,7 @@ impl PyAlignSpec {
         } else {
             None
         };
-        
+
         // Создаем и возвращаем финальную структуру
         Ok(Self(AlignSpec {
             horiz: h_opt,
@@ -109,7 +108,7 @@ impl Editor {
     fn add_worksheet_at<'py>(
         mut slf: PyRefMut<'py, Self>,
         sheet_name: &str,
-        index: usize
+        index: usize,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.editor
             .add_worksheet_at(sheet_name, index)
@@ -122,6 +121,25 @@ impl Editor {
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.editor
             .with_worksheet(sheet_name)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(slf)
+    }
+    fn rename_worksheet<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        old_name: &str,
+        new_name: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.editor
+            .rename_worksheet(old_name, new_name)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(slf)
+    }
+    fn delete_worksheet<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        sheet_name: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.editor
+            .delete_worksheet(sheet_name)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
