@@ -191,7 +191,7 @@ impl StyleIndex {
             match ev {
                 Event::Start(ref e) if e.name().as_ref() == b"fonts" => in_fonts = true,
                 Event::End(ref e) if e.name().as_ref() == b"fonts" => {
-                    in_fonts = false;
+                    // in_fonts = false;
                     break;
                 }
                 Event::Start(ref e) if in_fonts && e.name().as_ref() == b"font" => {
@@ -280,7 +280,7 @@ impl StyleIndex {
             match ev {
                 Event::Start(ref e) if e.name().as_ref() == b"fills" => in_fills = true,
                 Event::End(ref e) if e.name().as_ref() == b"fills" => {
-                    in_fills = false;
+                    // in_fills = false;
                     break;
                 }
                 Event::Start(ref e) if in_fills && e.name().as_ref() == b"fill" => {
@@ -342,7 +342,7 @@ impl StyleIndex {
             match ev {
                 Event::Start(ref e) if e.name().as_ref() == b"borders" => in_borders = true,
                 Event::End(ref e) if e.name().as_ref() == b"borders" => {
-                    in_borders = false;
+                    // in_borders = false;
                     break;
                 }
                 Event::Start(ref e) if in_borders && e.name().as_ref() == b"border" => {
@@ -421,7 +421,7 @@ impl StyleIndex {
             match ev {
                 Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
                 Event::End(ref e) if e.name().as_ref() == b"cellXfs" => {
-                    in_xfs = false;
+                    // in_xfs = false;
                     break;
                 }
 
@@ -827,14 +827,17 @@ impl XlsxEditor {
             Target::Cell(cell) => {
                 let sid = self.cell_style_id(&cell)?;
                 let new_sid = *sid_cache.entry(sid).or_insert_with(|| {
-                    let old = self.read_style_parts(sid).unwrap(); // см. пункт 2
+                    let old = self.read_style_parts(sid).unwrap();
                     let merged = merge_style_parts(old, &patch);
-                    self.ensure_style_from_parts(&merged).unwrap() // см. пункт 3
+                    self.ensure_style_from_parts(&merged).unwrap()
                 });
                 self.apply_style_to_cell(&cell, new_sid)?;
             }
             Target::Rect { c0, r0, c1, r1 } => {
-                self.apply_patch_rect_one_pass(c0, r0, c1, r1, &patch)?
+                // 1) сначала гарантируем наличие <c r=".."> в диапазоне
+                // self.ensure_rect_cells_exist(c0, r0, c1, r1)?;
+                // 2) теперь быстрый проход по существующим c-тегам с мерджем стиля
+                self.apply_patch_rect_one_pass(c0, r0, c1, r1, &patch)?;
             }
             _ => bail!("Row/Col-level styling not implemented in this snippet"),
         }
@@ -982,8 +985,48 @@ impl XlsxEditor {
         Ok(sid)
     }
 }
+// impl XlsxEditor {
+//     fn cell_exists(&self, coord: &str) -> bool {
+//         let tag = format!(r#"<c r="{coord}""#);
+//         memmem::find(&self.sheet_xml, tag.as_bytes()).is_some()
+//     }
+
+//     fn ensure_rect_cells_exist(&mut self, c0: u32, r0: u32, c1: u32, r1: u32) -> Result<()> {
+//         for r in r0..=r1 {
+//             for c in c0..=c1 {
+//                 let coord = format!("{}{}", col_letter(c), r);
+//                 if !self.cell_exists(&coord) {
+//                     // создаём ячейку (apply_style_to_cell сам создаст row/cell при отсутствии)
+//                     self.apply_style_to_cell(&coord, 0)?;
+//                 }
+//             }
+//         }
+//         Ok(())
+//     }
+// }
+
+fn merge_align(base: Option<AlignSpec>, patch: Option<AlignSpec>) -> Option<AlignSpec> {
+    match (base, patch) {
+        (b, None) => b,
+        (None, Some(p)) => Some(p),
+        (Some(mut b), Some(p)) => {
+            if p.horiz.is_some() {
+                b.horiz = p.horiz;
+            }
+            if p.vert.is_some() {
+                b.vert = p.vert;
+            }
+            b.wrap = b.wrap || p.wrap; // wrap только «наращиваем»
+            Some(b)
+        }
+    }
+}
 
 fn merge_style_parts(mut base: StyleParts, patch: &StyleParts) -> StyleParts {
+    if patch.align.is_some() {
+        base.align = merge_align(base.align, patch.align.clone());
+    }
+
     if patch.num_fmt_code.is_some() {
         base.num_fmt_code = patch.num_fmt_code.clone();
     }
@@ -1194,10 +1237,10 @@ impl XlsxEditor {
             if al.horiz.is_some() || al.vert.is_some() || al.wrap {
                 xf.push_str("<alignment");
                 if let Some(h) = &al.horiz {
-                    xf.push_str(&format!(r#" horizontal="{}""#, h.to_string()));
+                    xf.push_str(&format!(r#" horizontal="{}""#, h));
                 }
                 if let Some(v) = &al.vert {
-                    xf.push_str(&format!(r#" vertical="{}""#, v.to_string()));
+                    xf.push_str(&format!(r#" vertical="{}""#, v));
                 }
                 if al.wrap {
                     xf.push_str(r#" wrapText="1""#);
@@ -1433,7 +1476,7 @@ impl XlsxEditor {
         rdr.config_mut().trim_text(true);
         let mut in_xfs = false;
         let mut xf_idx = 0u32;
-        let mut depth = 0;
+        // let mut depth = 0;
 
         while let Ok(ev) = rdr.read_event() {
             match ev {
@@ -1442,7 +1485,7 @@ impl XlsxEditor {
 
                 Event::Start(ref e) if in_xfs && e.name().as_ref() == b"xf" => {
                     if xf_idx == style_id {
-                        depth = 1;
+                        let mut depth = 1;
                         while depth > 0 {
                             match rdr.read_event()? {
                                 Event::Start(ref ie) => {
@@ -1673,27 +1716,45 @@ impl XlsxEditor {
     }
 
     fn ensure_cols_block(&mut self) -> Result<(usize, usize)> {
+        use memchr::memmem;
+
+        // уже есть?
         if let (Some(start), Some(end)) = (
-            memmem::rfind(&self.sheet_xml, b"<cols>"),
-            memmem::rfind(&self.sheet_xml, b"</cols>"),
+            memmem::find(&self.sheet_xml, b"<cols>"),
+            memmem::find(&self.sheet_xml, b"</cols>"),
         ) {
             return Ok((start, end + "</cols>".len()));
         }
 
-        // куда вставлять: после </sheetFormatPr> если он есть, иначе перед <sheetData>
-        let anchor_end = if let Some(p) = memmem::rfind(&self.sheet_xml, b"</sheetFormatPr>") {
-            p + "</sheetFormatPr>".len()
-        } else {
-            memmem::rfind(&self.sheet_xml, b"<sheetData")
-                .context("<sheetData> not found on the current sheet")?
-        };
+        // найдём опорные точки
+        let sd_pos = memmem::find(&self.sheet_xml, b"<sheetData")
+            .context("<sheetData> not found on the current sheet")?;
 
+        // гарантируем наличие <dimension .../> ПЕРЕД cols
+        let (insert_after_dim, _inserted_len): (usize, usize) =
+            if let Some(dim_start) = memmem::find(&self.sheet_xml, b"<dimension") {
+                // конец тега <dimension ...>
+                let dim_end = crate::style::find_bytes_from(&self.sheet_xml, b">", dim_start)
+                    .context("<dimension> not closed")?
+                    + 1;
+                (dim_end, 0)
+            } else {
+                // создаём минимальный dimension прямо перед sheetData
+                let dim_tag = r#"<dimension ref="A1"/>"#.as_bytes();
+                self.sheet_xml
+                    .splice(sd_pos..sd_pos, dim_tag.iter().copied());
+                (sd_pos + dim_tag.len(), dim_tag.len())
+            };
+
+        // вставляем пустой блок cols СРАЗУ ПОСЛЕ <dimension ...>
         let block = b"<cols></cols>";
         self.sheet_xml
-            .splice(anchor_end..anchor_end, block.iter().copied());
+            .splice(insert_after_dim..insert_after_dim, block.iter().copied());
 
-        let start = anchor_end;
+        // вернуть границы нового блока
+        let start = insert_after_dim;
         let end = start + block.len();
+
         Ok((start, end))
     }
 

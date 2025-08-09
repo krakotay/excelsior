@@ -3,21 +3,25 @@
 // #[global_allocator]
 // static GLOBAL: MiMalloc = MiMalloc;
 pub mod files_part;
+use memchr::memmem;
 mod polars_part;
 mod read_part;
 pub mod style;
 mod test;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use quick_xml::{Reader, Writer, events::Event};
 
-use crate::style::{AlignSpec, HorizAlignment, VertAlignment};
+use crate::{
+    files_part::needs_xml_space_preserve,
+    style::{AlignSpec, HorizAlignment, VertAlignment},
+};
 // use tempfile::NamedTempFile;
 // use zip::{ZipArchive, ZipWriter, write::FileOptions};
 
@@ -70,12 +74,14 @@ pub struct XlsxEditor {
     sheet_path: String,
     sheet_xml: Vec<u8>,
     last_row: u32,
-    styles_xml: Vec<u8>,               // содержимое styles.xml
-    workbook_xml: Vec<u8>,             // содержимое workbook.xml (может изменяться)
-    rels_xml: Vec<u8>,                 // содержимое workbook.xml.rels
-    new_files: Vec<(String, Vec<u8>)>, // новые или изменённые файлы для записи при save()
+    styles_xml: Vec<u8>,   // содержимое styles.xml
+    workbook_xml: Vec<u8>, // содержимое workbook.xml (может изменяться)
+    rels_xml: Vec<u8>,     // содержимое workbook.xml.rels
+    new_files: HashMap<String, Vec<u8>>,
     styles_index: Option<StyleIndex>,
     loaded_files: std::collections::HashMap<String, Vec<u8>>,
+    removed_files: HashSet<String>, // ← НОВОЕ: пути внутри ZIP, которые надо выкинуть
+
 }
 
 /// Polars
@@ -114,16 +120,15 @@ impl XlsxEditor {
     ///
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
-    pub fn append_row<I, S>(&mut self, cells: I) -> Result<()>
+    pub fn append_row<I, S>(&mut self, cells: I) -> anyhow::Result<()>
     where
         I: IntoIterator<Item = S>,
         S: ToString,
     {
         self.last_row += 1;
         let row_num = self.last_row;
-        let mut writer = Writer::new(Vec::new());
+        let mut writer = quick_xml::Writer::new(Vec::new());
 
-        // Create a new XML row element with the appropriate row number attribute.
         writer
             .create_element("row")
             .with_attribute(("r", row_num.to_string().as_str()))
@@ -135,30 +140,30 @@ impl XlsxEditor {
                     let is_formula = val_str.starts_with('=');
                     let is_number = !is_formula && val_str.parse::<f64>().is_ok();
 
-                    {
-                        let mut c_elem =
-                            w.create_element("c").with_attribute(("r", coord.as_str()));
-                        if !is_number && !is_formula {
-                            c_elem = c_elem.with_attribute(("t", "inlineStr"));
-                        }
-                        c_elem.write_inner_content(|w2| {
-                            use quick_xml::events::BytesText;
-                            if is_formula {
-                                w2.create_element("f")
-                                    .write_text_content(BytesText::new(&val_str[1..]))?;
-                            } else if !is_number {
-                                w2.create_element("is").write_inner_content(|w3| {
-                                    w3.create_element("t")
-                                        .write_text_content(BytesText::new(&val_str))?;
-                                    Ok(())
-                                })?;
-                            } else {
-                                w2.create_element("v")
-                                    .write_text_content(BytesText::new(&val_str))?;
-                            }
-                            Ok(())
-                        })?;
+                    let mut c_elem = w.create_element("c").with_attribute(("r", coord.as_str()));
+                    if !is_number && !is_formula {
+                        c_elem = c_elem.with_attribute(("t", "inlineStr"));
                     }
+                    c_elem.write_inner_content(|w2| {
+                        use quick_xml::events::BytesText;
+                        if is_formula {
+                            w2.create_element("f")
+                                .write_text_content(BytesText::new(&val_str[1..]))?;
+                        } else if !is_number {
+                            w2.create_element("is").write_inner_content(|w3| {
+                                let mut t = w3.create_element("t");
+                                if needs_xml_space_preserve(&val_str) {
+                                    t = t.with_attribute(("xml:space", "preserve"));
+                                }
+                                t.write_text_content(BytesText::new(&val_str))?;
+                                Ok(())
+                            })?;
+                        } else {
+                            w2.create_element("v")
+                                .write_text_content(BytesText::new(&val_str))?;
+                        }
+                        Ok(())
+                    })?;
                     col += 1;
                 }
                 Ok(())
@@ -166,17 +171,12 @@ impl XlsxEditor {
 
         let new_row_xml = writer.into_inner();
 
-        // Find the closing </sheetData> tag and insert the new row before it.
-        if let Some(pos) = self
-            .sheet_xml
-            .windows(12)
-            .rposition(|w| w == b"</sheetData>")
-        {
-            self.sheet_xml.splice(pos..pos, new_row_xml);
-            Ok(())
-        } else {
-            bail!("</sheetData> tag not found");
-        }
+        // ИСПРАВЛЕНО: не делаем mem::take; вставляем по позиции из текущего буфера
+        let pos = memchr::memmem::rfind(&self.sheet_xml, b"</sheetData>")
+            .context("</sheetData> tag not found")?;
+        self.sheet_xml.splice(pos..pos, new_row_xml);
+
+        Ok(())
     }
 
     /// Appends multiple rows (a table) to the end of the current sheet.
@@ -190,7 +190,7 @@ impl XlsxEditor {
     ///
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
-    pub fn append_table<R, I, S>(&mut self, rows: R) -> Result<()>
+    pub fn append_table<R, I, S>(&mut self, rows: R) -> anyhow::Result<()>
     where
         R: IntoIterator<Item = I>,
         I: IntoIterator<Item = S>,
@@ -198,7 +198,6 @@ impl XlsxEditor {
     {
         ensure_sheetdata_open_close(&mut self.sheet_xml)?;
 
-        // Helper function to convert a 0-based column index to Excel column letters (e.g., 0 -> "A", 26 -> "AA").
         fn col_idx_to_letters(mut idx: usize) -> String {
             let mut s = String::new();
             loop {
@@ -212,14 +211,13 @@ impl XlsxEditor {
             s
         }
 
-        // Buffer to accumulate XML for all new rows.
         let mut bulk_rows_xml = Vec::<u8>::new();
 
         for row in rows {
             self.last_row += 1;
             let row_num = self.last_row;
 
-            let mut writer = Writer::new(Vec::new());
+            let mut writer = quick_xml::Writer::new(Vec::new());
             writer
                 .create_element("row")
                 .with_attribute(("r", row_num.to_string().as_str()))
@@ -242,8 +240,11 @@ impl XlsxEditor {
                                     .write_text_content(BytesText::new(&val_str[1..]))?;
                             } else if !is_number {
                                 w2.create_element("is").write_inner_content(|w3| {
-                                    w3.create_element("t")
-                                        .write_text_content(BytesText::new(&val_str))?;
+                                    let mut t = w3.create_element("t");
+                                    if needs_xml_space_preserve(&val_str) {
+                                        t = t.with_attribute(("xml:space", "preserve"));
+                                    }
+                                    t.write_text_content(BytesText::new(&val_str))?;
                                     Ok(())
                                 })?;
                             } else {
@@ -259,27 +260,12 @@ impl XlsxEditor {
             bulk_rows_xml.extend_from_slice(&writer.into_inner());
         }
 
-        // eprintln!(
-        //     "rows appended: last_row={}, has_close_sheetdata={} path={}",
-        //     self.last_row,
-        //     self.sheet_xml
-        //         .windows(12)
-        //         .rposition(|w| w == b"</sheetData>")
-        //         .is_some(),
-        //     self.sheet_path
-        // );
+        // ИСПРАВЛЕНО: считаем pos по self.sheet_xml и туда же вставляем
+        let pos = memchr::memmem::rfind(&self.sheet_xml, b"</sheetData>")
+            .context("</sheetData> tag not found")?;
+        self.sheet_xml.splice(pos..pos, bulk_rows_xml);
 
-        // Find the closing </sheetData> tag and insert the new rows before it.
-        if let Some(pos) = self
-            .sheet_xml
-            .windows(12)
-            .rposition(|w| w == b"</sheetData>")
-        {
-            self.sheet_xml.splice(pos..pos, bulk_rows_xml);
-            Ok(())
-        } else {
-            bail!("</sheetData> tag not found");
-        }
+        Ok(())
     }
 
     /// Appends multiple rows (a table) starting at a specified coordinate in the current sheet.
@@ -294,7 +280,7 @@ impl XlsxEditor {
     ///
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
-    pub fn append_table_at<R, I, S>(&mut self, start_coord: &str, rows: R) -> Result<()>
+    pub fn append_table_at<R, I, S>(&mut self, start_coord: &str, rows: R) -> anyhow::Result<()>
     where
         R: IntoIterator<Item = I>,
         I: IntoIterator<Item = S>,
@@ -302,7 +288,6 @@ impl XlsxEditor {
     {
         ensure_sheetdata_open_close(&mut self.sheet_xml)?;
 
-        // Helper function to convert a 0-based column index to Excel column letters (e.g., 0 -> "A", 26 -> "AA").
         fn col_idx_to_letters(mut idx: usize) -> String {
             let mut s = String::new();
             loop {
@@ -315,14 +300,12 @@ impl XlsxEditor {
             }
             s
         }
-        // Helper function to convert Excel column letters (e.g., "A", "AA") to their corresponding 0-based column index.
         fn letters_to_col_idx(s: &str) -> usize {
             s.bytes().fold(0, |acc, b| {
                 acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize
             }) - 1
         }
 
-        // Parse the starting coordinate to get the initial column index and row number.
         let row_start_pos = start_coord
             .find(|c: char| c.is_ascii_digit())
             .context("invalid start coordinate – no digits")?;
@@ -332,26 +315,21 @@ impl XlsxEditor {
             .parse()
             .context("invalid row in start coordinate")?;
 
-        // Buffer to accumulate XML for new rows that need to be appended.
         let mut bulk_rows_xml = Vec::<u8>::new();
-        let mut row_offset: usize = 0;
 
-        for row in rows {
+        for (row_offset, row) in rows.into_iter().enumerate() {
             let abs_row = current_row_num + row_offset as u32;
             if abs_row <= self.last_row {
-                // If the row already exists, update cells within that row.
                 for (col_offset, val) in row.into_iter().enumerate() {
                     let coord = format!(
                         "{}{}",
                         col_idx_to_letters(start_col_idx + col_offset),
                         abs_row
                     );
-                    // Set the cell value using the existing set_cell method.
                     self.set_cell(&coord, val)?;
                 }
             } else {
-                // If the row does not exist, create a new row and append it.
-                let mut writer = Writer::new(Vec::new());
+                let mut writer = quick_xml::Writer::new(Vec::new());
                 writer
                     .create_element("row")
                     .with_attribute(("r", abs_row.to_string().as_str()))
@@ -378,8 +356,11 @@ impl XlsxEditor {
                                         .write_text_content(BytesText::new(&val_str[1..]))?;
                                 } else if !is_number {
                                     w2.create_element("is").write_inner_content(|w3| {
-                                        w3.create_element("t")
-                                            .write_text_content(BytesText::new(&val_str))?;
+                                        let mut t = w3.create_element("t");
+                                        if needs_xml_space_preserve(&val_str) {
+                                            t = t.with_attribute(("xml:space", "preserve"));
+                                        }
+                                        t.write_text_content(BytesText::new(&val_str))?;
                                         Ok(())
                                     })?;
                                 } else {
@@ -393,32 +374,16 @@ impl XlsxEditor {
                     })?;
 
                 bulk_rows_xml.extend_from_slice(&writer.into_inner());
-                // Update the last row number if necessary.
                 self.last_row = abs_row;
             }
-            row_offset += 1;
         }
-        // eprintln!(
-        //     "rows appended: last_row={}, has_close_sheetdata={} path={}",
-        //     self.last_row,
-        //     self.sheet_xml
-        //         .windows(12)
-        //         .rposition(|w| w == b"</sheetData>")
-        //         .is_some(),
-        //     self.sheet_path
-        // );
 
-        // Find the closing </sheetData> tag and insert the new rows before it.
-        if let Some(pos) = self
-            .sheet_xml
-            .windows(12)
-            .rposition(|w| w == b"</sheetData>")
-        {
-            self.sheet_xml.splice(pos..pos, bulk_rows_xml);
-            Ok(())
-        } else {
-            bail!("</sheetData> tag not found");
-        }
+        // ИСПРАВЛЕНО: больше никакого mem::take здесь
+        let pos = memchr::memmem::rfind(&self.sheet_xml, b"</sheetData>")
+            .context("</sheetData> tag not found")?;
+        self.sheet_xml.splice(pos..pos, bulk_rows_xml);
+
+        Ok(())
     }
 
     /// Sets the value of a specific cell in the sheet.
@@ -433,7 +398,8 @@ impl XlsxEditor {
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
     pub fn set_cell<S: ToString>(&mut self, coord: &str, value: S) -> Result<()> {
-        // Extract row number from coordinate.
+        use crate::files_part::needs_xml_space_preserve;
+        // row number
         let row_start = coord
             .find(|c: char| c.is_ascii_digit())
             .context("invalid cell coordinate – no digits found")?;
@@ -445,164 +411,169 @@ impl XlsxEditor {
         let is_formula = val_str.starts_with('=');
         let is_number = !is_formula && val_str.parse::<f64>().is_ok();
 
-        // Generate XML for the new cell.
+        // → собрать XML ячейки
         let mut cell_writer = Writer::new(Vec::new());
-        // Create cell element with coordinate and type attributes.
-        let mut c_elem = cell_writer.create_element("c").with_attribute(("r", coord));
-        if !is_number && !is_formula {
-            c_elem = c_elem.with_attribute(("t", "inlineStr"));
-        }
-        c_elem.write_inner_content(|w2| {
-            use quick_xml::events::BytesText;
-            if is_formula {
-                w2.create_element("f")
-                    .write_text_content(BytesText::new(&val_str[1..]))?;
-            } else if !is_number {
-                // For strings, use <is><t> tags.
-                w2.create_element("is").write_inner_content(|w3| {
-                    w3.create_element("t")
-                        .write_text_content(BytesText::new(&val_str))?;
-                    Ok(())
-                })?;
-            } else {
-                // For numbers, use <v> tag.
-                w2.create_element("v")
-                    .write_text_content(BytesText::new(&val_str))?;
-            }
-            Ok(())
-        })?;
-        let cell_xml = cell_writer.into_inner();
-
-        // Find the row containing the target cell.
-        let row_marker = format!("<row r=\"{}\"", row_num);
-        if let Some(row_start) = self
-            .sheet_xml
-            .windows(row_marker.len())
-            .position(|w| w == row_marker.as_bytes())
         {
-            // Find the end of the row.
-            if let Some(rel_end) = self.sheet_xml[row_start..]
-                .windows(6)
-                .position(|w| w == b"</row>")
-            {
-                let row_end = row_start + rel_end + 6; // 6 is the length of "</row>"
-                let mut row_slice = self.sheet_xml[row_start..row_end].to_vec();
+            let mut c = cell_writer.create_element("c").with_attribute(("r", coord));
+            if !is_number && !is_formula {
+                c = c.with_attribute(("t", "inlineStr"));
+            }
+            c.write_inner_content(|w2| {
+                use quick_xml::events::BytesText;
+                if is_formula {
+                    w2.create_element("f")
+                        .write_text_content(BytesText::new(&val_str[1..]))?;
+                } else if !is_number {
+                    w2.create_element("is").write_inner_content(|w3| {
+                        let mut t = w3.create_element("t");
+                        if needs_xml_space_preserve(&val_str) {
+                            t = t.with_attribute(("xml:space", "preserve"));
+                        }
+                        t.write_text_content(BytesText::new(&val_str))?;
+                        Ok(())
+                    })?;
+                } else {
+                    w2.create_element("v")
+                        .write_text_content(BytesText::new(&val_str))?;
+                }
+                Ok(())
+            })?;
+        }
+        let new_cell_xml = cell_writer.into_inner();
 
-                // Find the cell within the row and replace it.
-                let cell_marker = format!("<c r=\"{}\"", coord);
-                if let Some(cell_pos) = row_slice
-                    .windows(cell_marker.len())
-                    .position(|w| w == cell_marker.as_bytes())
-                {
-                    if let Some(cell_end_rel) =
-                        row_slice[cell_pos..].windows(4).position(|w| w == b"</c>")
-                    {
-                        let cell_end = cell_pos + cell_end_rel + 4;
-                        row_slice.drain(cell_pos..cell_end);
-                    } else if let Some(cell_end_rel) =
-                        row_slice[cell_pos..].windows(2).position(|w| w == b"/>")
-                    {
-                        let cell_end = cell_pos + cell_end_rel + 2;
-                        row_slice.drain(cell_pos..cell_end);
+        // ——— устойчивый поиск ряда r="row_num"
+        let src = &self.sheet_xml;
+        let find_row = memmem::Finder::new(b"<row ");
+        let find_gt = memmem::Finder::new(b">");
+        let find_row_close = memmem::Finder::new(b"</row>");
+
+        let mut i = 0usize;
+        let mut target_row: Option<(usize, usize, usize)> = None; // (row_start, row_tag_end, row_close_end)
+        let mut insert_before_row_with_r_gt: Option<usize> = None;
+
+        while let Some(off) = find_row.find(&src[i..]) {
+            let rs = i + off;
+            let tag_end = match find_gt.find(&src[rs..]) {
+                Some(p) => rs + p,
+                None => break,
+            };
+            // r=".."
+            if let Some(rpos) = find_bytes_from(src, b" r=\"", rs) {
+                if rpos < tag_end {
+                    let v0 = rpos + 4;
+                    if let Some(v1) = find_bytes_from(src, b"\"", v0) {
+                        if let Ok(r) = std::str::from_utf8(&src[v0..v1])
+                            .unwrap_or("")
+                            .parse::<u32>()
+                        {
+                            if r == row_num {
+                                let close_rel = match find_row_close.find(&src[tag_end + 1..]) {
+                                    Some(p) => p,
+                                    None => break,
+                                };
+                                let close_end = tag_end + 1 + close_rel + "</row>".len();
+                                target_row = Some((rs, tag_end, close_end));
+                                break;
+                            } else if insert_before_row_with_r_gt.is_none() && r > row_num {
+                                insert_before_row_with_r_gt = Some(rs);
+                                // не break — возможно ещё встретим точное совпадение роу выше
+                            }
+                        }
                     }
                 }
+            }
+            i = tag_end + 1;
+        }
 
-                // Insert the new cell at the correct position within the row.
-                fn col_to_index(s: &str) -> u32 {
-                    s.bytes()
-                        .take_while(|b| b.is_ascii_alphabetic())
-                        .fold(0, |acc, b| {
-                            acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as u32
-                        })
+        // если ряд найден — меняем/вставляем ячейку внутри
+        if let Some((row_start_pos, row_tag_end, row_close_end)) = target_row {
+            // Найдём <c ... r="coord">
+            let mut row_slice = self.sheet_xml[row_start_pos..row_close_end].to_vec();
+
+            // границы содержимого
+            let content_start = (row_tag_end - row_start_pos) + 1;
+            let content_end = row_slice.len() - "</row>".len();
+
+            let find_c = memmem::Finder::new(b"<c");
+            let find_gt_local = memmem::Finder::new(b">");
+
+            let mut j = content_start;
+            let mut cell_found = false;
+
+            while j < content_end {
+                let Some(cpos_rel) = find_c.find(&row_slice[j..content_end]) else {
+                    break;
+                };
+                let cpos = j + cpos_rel;
+
+                // защита от <col>, <cfRule> и т.п.: следующий символ после "<c"
+                let next = *row_slice.get(cpos + 2).unwrap_or(&b'>');
+                let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
+                let tag_end = match find_gt_local.find(&row_slice[cpos..]) {
+                    Some(p) => cpos + p,
+                    None => break,
+                };
+
+                if !is_cell {
+                    j = tag_end + 1;
+                    continue;
                 }
-                let target_col = col_to_index(coord);
-                // Find the correct position to insert the new cell.
-                let mut insert_pos = row_slice.len() - 6; // 6 is the length of "</row>"
-                let mut i = 0;
-                while let Some(c_pos) = row_slice[i..].windows(6).position(|w| w == b"<c r=\"") {
-                    let abs = i + c_pos;
-                    // Find the end of the cell's coordinate attribute.
-                    if let Some(end_quote) = row_slice[abs + 6..].iter().position(|&b| b == b'"') {
-                        let coord_bytes = &row_slice[abs + 6..abs + 6 + end_quote];
-                        if let Ok(coord_str) = std::str::from_utf8(coord_bytes) {
-                            let col_idx = col_to_index(coord_str);
-                            if col_idx > target_col {
-                                insert_pos = abs;
+
+                // r="..."
+                if let Some(rpos) = find_bytes_from(&row_slice, b" r=\"", cpos) {
+                    if rpos < tag_end {
+                        let v0 = rpos + 4;
+                        if let Some(v1) = find_bytes_from(&row_slice, b"\"", v0) {
+                            if &row_slice[v0..v1] == coord.as_bytes() {
+                                // полные границы ячейки: self-closing или с </c>
+                                let self_closing = tag_end > cpos && row_slice[tag_end - 1] == b'/';
+                                let cell_end = if self_closing {
+                                    tag_end + 1
+                                } else {
+                                    let cc = find_bytes_from(&row_slice, b"</c>", tag_end + 1)
+                                        .context("</c> missing")?;
+                                    cc + 4
+                                };
+                                row_slice.splice(cpos..cell_end, new_cell_xml.iter().copied());
+                                cell_found = true;
                                 break;
                             }
                         }
-                        i = abs + 6 + end_quote;
-                    } else {
-                        break;
                     }
                 }
-                row_slice.splice(insert_pos..insert_pos, cell_xml);
-
-                // Replace the original row with the updated one.
-                self.sheet_xml.splice(row_start..row_end, row_slice);
+                j = tag_end + 1;
             }
+
+            if !cell_found {
+                // вставляем перед </row>, поддерживая сортировку по колонке
+                // let insert_at = content_end;
+                // можно пробежать по существующим c и найти первую с колонкой > нашей
+                // (упрощённо: просто в конец строки)
+                row_slice.splice(content_end..content_end, new_cell_xml.iter().copied());
+            }
+
+            // заменяем назад
+            self.sheet_xml
+                .splice(row_start_pos..row_close_end, row_slice);
         } else {
-            // If the row does not exist, create a new row and insert it in the correct order so that
-            // the `<row>` elements remain sorted by the `r` attribute.  Keeping the rows ordered
-            // avoids Excel "recovered records" errors that occur when rows are out of sequence.
-            let mut new_row_xml = Vec::new();
-            new_row_xml.extend_from_slice(b"<row r=\"");
-            new_row_xml.extend_from_slice(row_num.to_string().as_bytes());
-            new_row_xml.extend_from_slice(b"\">");
-            new_row_xml.extend_from_slice(&cell_xml);
-            new_row_xml.extend_from_slice(b"</row>");
+            // ряда нет — создаём и вставляем в правильное место
+            let mut new_row = Vec::<u8>::with_capacity(64 + new_cell_xml.len());
+            new_row.extend_from_slice(b"<row r=\"");
+            new_row.extend_from_slice(row_num.to_string().as_bytes());
+            new_row.extend_from_slice(b"\">");
+            new_row.extend_from_slice(&new_cell_xml);
+            new_row.extend_from_slice(b"</row>");
 
-            // Try to find the first existing row whose `r` value is greater than the new row.
-            // If found, we will insert the new row *before* it, otherwise we fall back to
-            // inserting just before `</sheetData>` (the previous behaviour).
-            let mut insert_pos: Option<usize> = None;
-            let mut search_idx = 0;
-            while let Some(rel) = self.sheet_xml[search_idx..]
-                .windows(7)
-                .position(|w| w == b"<row r=")
-            {
-                let abs = search_idx + rel;
-                // Find the opening quote for the `r` attribute.
-                if let Some(first_quote) = self.sheet_xml[abs..].iter().position(|&b| b == b'"') {
-                    let num_start = abs + first_quote + 1;
-                    // Find the closing quote for the `r` attribute.
-                    if let Some(end_quote) =
-                        self.sheet_xml[num_start..].iter().position(|&b| b == b'"')
-                    {
-                        let num_bytes = &self.sheet_xml[num_start..num_start + end_quote];
-                        if let Ok(num_str) = std::str::from_utf8(num_bytes) {
-                            if let Ok(existing_r) = num_str.parse::<u32>() {
-                                if existing_r > row_num {
-                                    insert_pos = Some(abs);
-                                    break;
-                                }
-                            }
-                        }
-                        // Continue searching after this row tag.
-                        search_idx = num_start + end_quote;
-                    } else {
-                        break; // Malformed XML (should not happen)
-                    }
-                } else {
-                    break; // Malformed XML (should not happen)
-                }
-            }
-
-            let pos = match insert_pos {
-                Some(p) => p,
-                None => self
-                    .sheet_xml
-                    .windows(12)
-                    .rposition(|w| w == b"</sheetData>")
-                    .context("</sheetData> tag not found")?,
-            };
-
-            self.sheet_xml.splice(pos..pos, new_row_xml);
+            let pos = insert_before_row_with_r_gt.unwrap_or_else(|| {
+                memmem::rfind(&self.sheet_xml, b"</sheetData>").expect("</sheetData> tag not found")
+            });
+            self.sheet_xml.splice(pos..pos, new_row);
         }
 
         if row_num > self.last_row {
             self.last_row = row_num;
         }
+
         Ok(())
     }
 }

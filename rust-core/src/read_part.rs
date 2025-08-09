@@ -41,10 +41,8 @@ impl XlsxEditor {
                             .then(|| String::from_utf8_lossy(&a.value).into_owned())
                     }) {
                         let (col, row) = split_coord(&coord);
-                        if targets.contains(&col) {
-                            if row > last_row {
-                                last_row = row;
-                            }
+                        if targets.contains(&col) && row > last_row {
+                            last_row = row;
                         }
                     }
                 }
@@ -117,4 +115,3 @@ impl XlsxEditor {
         Ok(per_col_last)
     }
 }
-

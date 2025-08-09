@@ -121,8 +121,7 @@ fn set_border() -> Result<()> {
     let file_name_out = "../test/style_test_out_borders.xlsx";
 
     let mut xl: XlsxEditor = XlsxEditor::open(file_name, "Sheet1")?;
-    xl
-        .set_border("A2:C3", "thin")?
+    xl.set_border("A2:C3", "thin")?
         .set_fill("A2:C3", "FFCCCC")?
         .set_font("A2:C3", "Arial", 12.0, true, false)?
         .set_alignment(
@@ -203,12 +202,29 @@ fn add_worksheet() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-#[cfg(feature = "polars")]
-use polars_core::prelude::*;
+#[test]
+fn rename_del_worksheet() -> Result<()> {
+    let file_name = "../test/test_rename_worksheets.xlsx";
+    let file_name_out = "../test/rename_worksheets_out.xlsx";
+
+    let mut xl: XlsxEditor = XlsxEditor::open(file_name, "Sheet1")?;
+    xl.rename_worksheet("for_rename", "renamed")?
+        .delete_worksheet("for_delete")?;
+
+    xl.save(file_name_out)?;
+    let new_sheets: Vec<String> = scan(file_name_out)?;
+    println!("New sheets: {:?}", new_sheets);
+    assert!(new_sheets.contains(&"renamed".to_owned()));
+    assert!(!new_sheets.contains(&"for_delete".to_owned()));
+
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "polars")]
 fn test_write_polars() -> Result<()> {
+    use polars_core::prelude::*;
+
     let file_name = "../test/test.xlsx"; // Шаблон53. РД Выборка.xlsx result.xlsx
     let sheet_names: Vec<String> = scan(file_name)?;
     let mut app = XlsxEditor::open(file_name, &sheet_names[0])?;

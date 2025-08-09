@@ -1,14 +1,102 @@
 /// files_part.rs
-use crate::{find_bytes_from, scan, XlsxEditor};
+use crate::{XlsxEditor, find_bytes_from, scan};
 use ::zip as zip_crate;
 use anyhow::{Context, Result, bail};
 use memchr::memmem;
 use quick_xml::{Reader, events::Event};
 use std::{
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
     path::Path,
-};
+}; // ← понадобится для dimension
+
+pub(crate) fn needs_xml_space_preserve(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    b[0].is_ascii_whitespace()
+        || b.last().unwrap().is_ascii_whitespace()
+        || b.iter().any(|&c| matches!(c, b'\n' | b'\r' | b'\t'))
+}
+
+// A1 … A1:Z99
+fn update_dimension_bytes(xml: &mut Vec<u8>) {
+    // 1) вычисляем максимум по <c r="..">
+    let (mut max_c, mut max_r) = (0u32, 0u32);
+    let f = memmem::Finder::new(b"<c r=\"");
+    let mut i = 0usize;
+    while let Some(off) = f.find(&xml[i..]) {
+        let start = i + off;
+        let v0 = start + 6;
+        let Some(v1) = super::find_bytes_from(xml, b"\"", v0) else {
+            break;
+        };
+        let coord = &xml[v0..v1];
+        if let Some(p) = coord.iter().position(|b| b.is_ascii_digit()) {
+            let mut cidx: u32 = 0;
+            for &b in &coord[..p] {
+                let u = (b as char).to_ascii_uppercase() as u8;
+                cidx = cidx * 26 + ((u - b'A') as u32 + 1);
+            }
+            if cidx > 0 {
+                max_c = max_c.max(cidx - 1);
+            }
+            if let Ok(rs) = std::str::from_utf8(&coord[p..]) {
+                if let Ok(rn) = rs.parse::<u32>() {
+                    max_r = max_r.max(rn);
+                }
+            }
+        }
+        i = v1 + 1;
+    }
+
+    // 2) собрать новый <dimension .../>
+    let dim_tag = if max_c == 0 && max_r <= 1 {
+        r#"<dimension ref="A1"/>"#.to_string()
+    } else {
+        let last = crate::style::col_letter(max_c);
+        format!(r#"<dimension ref="A1:{}{}"/>"#, last, max_r.max(1))
+    };
+
+    // 3) заменить/вставить с правильным местом
+    if let Some(start) = memmem::find(xml, b"<dimension") {
+        let end = super::find_bytes_from(xml, b">", start)
+            .map(|p| p + 1)
+            .unwrap_or(start);
+        xml.splice(start..end, dim_tag.bytes());
+    } else {
+        // если есть <cols>, вставляем ПЕРЕД ним; иначе — перед <sheetData>
+        if let Some(cols_pos) = memmem::find(xml, b"<cols") {
+            xml.splice(cols_pos..cols_pos, dim_tag.bytes());
+        } else if let Some(sd) = memmem::find(xml, b"<sheetData") {
+            xml.splice(sd..sd, dim_tag.bytes());
+        }
+    }
+}
+// добавляет Override в [Content_Types].xml, если нет
+fn ensure_ct_override_for_sheets(ct_xml: &mut Vec<u8>, sheet_paths: &[String]) {
+    // ищем </Types>
+    let Some(types_end) = memmem::rfind(ct_xml, b"</Types>") else {
+        return;
+    };
+
+    for p in sheet_paths {
+        if !p.starts_with("xl/worksheets/") || !p.ends_with(".xml") {
+            continue;
+        }
+        let part = format!("/{}", p);
+        let needle = format!(r#"PartName="{part}""#);
+        if memmem::find(&ct_xml, needle.as_bytes()).is_some() {
+            continue; // уже есть
+        }
+        let override_tag = format!(
+            r#"<Override PartName="{part}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#
+        );
+        ct_xml.splice(types_end..types_end, override_tag.bytes());
+    }
+}
 
 /// Work with files
 impl XlsxEditor {
@@ -90,25 +178,29 @@ impl XlsxEditor {
             styles_xml,
             workbook_xml,
             rels_xml,
-            new_files: Vec::new(),
+            new_files: HashMap::new(),
             styles_index: None,
             loaded_files: std::collections::HashMap::new(), // ← добавлено
+            removed_files: HashSet::new(),                  // ← НОВОЕ
         })
     }
 
     fn flush_current_sheet(&mut self) {
-        let cur_path = self.sheet_path.clone();
-        let cur_xml = self.sheet_xml.clone();
-        if let Some((_, c)) = self.new_files.iter_mut().find(|(p, _)| p == &cur_path) {
-            *c = cur_xml;
-        } else {
-            self.new_files.push((cur_path, cur_xml));
-        }
+        self.new_files
+            .insert(self.sheet_path.clone(), self.sheet_xml.clone());
+
+        // let cur_path = self.sheet_path.clone();
+        // let cur_xml = self.sheet_xml.clone();
+        // if let Some((_, c)) = self.new_files.iter_mut().find(|(p, _)| p == &cur_path) {
+        //     *c = cur_xml;
+        // } else {
+        //     self.new_files.push((cur_path, cur_xml));
+        // }
     }
 
     pub fn save<P: AsRef<Path>>(&mut self, dst: P) -> Result<()> {
-        
         self.flush_current_sheet();
+
         let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
         let mut zout = zip_crate::ZipWriter::new(File::create(dst)?);
 
@@ -124,88 +216,150 @@ impl XlsxEditor {
         use std::collections::HashSet;
         let mut written: HashSet<String> = HashSet::new();
 
-        for i in 0..zin.len() {
-            let file = zin.by_index_raw(i)?;
-            let name = file.name();
+        // 0) прочитаем [Content_Types].xml в буфер и допишем Override для новых листов
+        let mut ct_xml_opt: Option<Vec<u8>> = {
+            let mut z = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
+            if let Ok(mut f) = z.by_name("[Content_Types].xml") {
+                let mut buf = Vec::with_capacity(f.size() as usize);
+                use std::io::Read;
+                f.read_to_end(&mut buf).ok();
+                Some(buf)
+            } else {
+                None
+            }
+        };
+        if let Some(ct) = ct_xml_opt.as_mut() {
+            // собрать список новых листов
+            let mut new_sheet_paths: Vec<String> = self
+                .new_files
+                .keys()
+                .filter(|p| p.starts_with("xl/worksheets/") && p.ends_with(".xml"))
+                .cloned()
+                .collect();
+            // (опционально) если текущий лист вообще новый — он уже в new_files
+            new_sheet_paths.sort();
+            new_sheet_paths.dedup();
+            ensure_ct_override_for_sheets(ct, &new_sheet_paths);
+            // НОВОЕ: убрать overrides для удалённых листов
+            for p in &self.removed_files {
+                if p.starts_with("xl/worksheets/") && p.ends_with(".xml") {
+                    remove_ct_override_for_path(ct, p);
+                }
+            }
+        }
 
-            // Если есть новая версия файла — пишем её
-            if let Some((_, content)) = self.new_files.iter().find(|(p, _)| p == name) {
-                let opt = if should_store_uncompressed(name, content.len()) {
+        for i in 0..zin.len() {
+            let name = { zin.by_index_raw(i)?.name().to_string() };
+            // НОВОЕ: пропускаем удалённые файлы
+            if self.removed_files.contains(&name) {
+                continue;
+            }
+
+            // Новая версия файла?
+            if let Some(content) = self.new_files.get(&name) {
+                let mut out = content.clone();
+
+                // фиксим dimension для листов
+                if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+                    update_dimension_bytes(&mut out);
+                }
+
+                let opt = if should_store_uncompressed(&name, out.len()) {
                     stored
                 } else {
                     deflated
                 };
-                zout.start_file(name, opt)?;
-                zout.write_all(content)?;
-                written.insert(name.to_string());
+                zout.start_file(&name, opt)?;
+                zout.write_all(&out)?;
+                written.insert(name);
                 continue;
             }
 
-            match name {
+            match name.as_str() {
                 "xl/workbook.xml" => {
                     let content = &self.workbook_xml;
-                    let opt = if should_store_uncompressed(name, content.len()) {
+                    let opt = if should_store_uncompressed(&name, content.len()) {
                         stored
                     } else {
                         deflated
                     };
-                    zout.start_file(name, opt)?;
+                    zout.start_file(&name, opt)?;
                     zout.write_all(content)?;
                 }
                 "xl/_rels/workbook.xml.rels" => {
                     let content = &self.rels_xml;
-                    let opt = if should_store_uncompressed(name, content.len()) {
+                    let opt = if should_store_uncompressed(&name, content.len()) {
                         stored
                     } else {
                         deflated
                     };
-                    zout.start_file(name, opt)?;
-                    zout.write_all(content)?;
-                }
-                _ if name == self.sheet_path => {
-                    let content = &self.sheet_xml;
-                    let opt = if should_store_uncompressed(name, content.len()) {
-                        stored
-                    } else {
-                        deflated
-                    };
-                    zout.start_file(name, opt)?;
+                    zout.start_file(&name, opt)?;
                     zout.write_all(content)?;
                 }
                 "xl/styles.xml" => {
+                    // пишем актуальные стили, а не raw_copy
                     let mut content = self.styles_xml.clone();
-                    normalize_styles_root(&mut content);
-
-                    let opt = if should_store_uncompressed(name, content.len()) {
+                    normalize_styles_root(&mut content); // как и раньше
+                    let opt = if should_store_uncompressed(&name, content.len()) {
                         stored
                     } else {
                         deflated
                     };
-                    zout.start_file(name, opt)?;
+                    zout.start_file(&name, opt)?;
                     zout.write_all(&content)?;
                 }
-                "xl/calcChain.xml" => {
-                    continue;
+
+                "[Content_Types].xml" => {
+                    // если удалось прочитать/поправить — пишем её, иначе raw_copy
+                    if let Some(ct) = ct_xml_opt.take() {
+                        let opt = if should_store_uncompressed(&name, ct.len()) {
+                            stored
+                        } else {
+                            deflated
+                        };
+                        zout.start_file(&name, opt)?;
+                        zout.write_all(&ct)?;
+                    } else {
+                        let f = zin.by_index_raw(i)?;
+                        zout.raw_copy_file(f)?;
+                    }
                 }
-                _ => zout.raw_copy_file(file)?,
+                p if p == self.sheet_path => {
+                    // текущий лист (в буфере self.sheet_xml) — обновим dimension перед записью
+                    let mut content = self.sheet_xml.clone();
+                    update_dimension_bytes(&mut content);
+
+                    let opt = if should_store_uncompressed(&name, content.len()) {
+                        stored
+                    } else {
+                        deflated
+                    };
+                    zout.start_file(&name, opt)?;
+                    zout.write_all(&content)?;
+                }
+                _ => {
+                    let f = zin.by_index_raw(i)?;
+                    zout.raw_copy_file(f)?
+                }
             }
         }
 
-        // дозапись новых файлов, которых не было в исходном архиве
         for (path, content) in &self.new_files {
+            if self.removed_files.contains(path) {
+                continue; // НОВОЕ: не писать удалённые
+            }
             if !written.contains(path) {
-                let opt = if should_store_uncompressed(path, content.len()) {
+                let mut out = content.clone();
+                if path.starts_with("xl/worksheets/") && path.ends_with(".xml") {
+                    update_dimension_bytes(&mut out);
+                }
+                let opt = if should_store_uncompressed(path, out.len()) {
                     stored
                 } else {
                     deflated
                 };
                 zout.start_file(path, opt)?;
-                if path == &self.sheet_path {
-                    zout.write_all(&self.sheet_xml)?;
-                } else {
-                    zout.write_all(content)?;
-                }
-                written.insert(path.clone());
+                zout.write_all(&out)?;
             }
         }
 
@@ -332,7 +486,7 @@ impl XlsxEditor {
                 max_sheet_file = max_sheet_file.max(n);
             }
         }
-        for (path, _) in &self.new_files {
+        for path in self.new_files.keys() {
             if let Some(n) = path
                 .strip_prefix("xl/worksheets/sheet")
                 .and_then(|s| s.strip_suffix(".xml"))
@@ -442,30 +596,20 @@ impl XlsxEditor {
         self.workbook_xml = wb_xml;
         self.rels_xml = rels_xml;
 
-        // кладём текущий редактируемый лист в new_files (если ещё не лежит)
+        // забираем буферы без clone
         {
-            let cur_path = self.sheet_path.clone();
-            let cur_xml = self.sheet_xml.clone();
-            if let Some(pair) = self.new_files.iter_mut().find(|(p, _)| p == &cur_path) {
-                pair.1 = cur_xml;
-            } else {
-                self.new_files.push((cur_path, cur_xml));
+            let cur_path = std::mem::take(&mut self.sheet_path);
+            let cur_xml = std::mem::take(&mut self.sheet_xml);
+            if !cur_path.is_empty() {
+                self.new_files.insert(cur_path, cur_xml);
             }
         }
 
-        // создаём запись для нового листа
-        if let Some(pair) = self
-            .new_files
-            .iter_mut()
-            .find(|(p, _)| p == &new_sheet_path)
-        {
-            pair.1 = EMPTY_SHEET.as_bytes().to_vec();
-        } else {
-            self.new_files
-                .push((new_sheet_path.clone(), EMPTY_SHEET.as_bytes().to_vec()));
-        }
+        // сразу кладём заготовку нового листа
+        self.new_files
+            .insert(new_sheet_path.clone(), EMPTY_SHEET.as_bytes().to_vec());
 
-        // переключаем редактор на новый лист
+        // переключаемся
         self.sheet_path = new_sheet_path;
         self.sheet_xml = EMPTY_SHEET.as_bytes().to_vec();
         self.last_row = 0;
@@ -482,23 +626,16 @@ impl XlsxEditor {
 
 impl XlsxEditor {
     pub fn with_worksheet(&mut self, sheet_name: &str) -> Result<&mut Self> {
-        // 0) Если уже на этом листе — просто вернуть себя (опционально).
-        // У нас нет текущего имени, так что пропустим эту оптимизацию.
-
-        // 1) Сохраним текущий лист в new_files (как в add_worksheet_at)
+        // 0) Сохраняем текущий лист в new_files без лишних clone
         {
-            let cur_path = self.sheet_path.clone();
-            let cur_xml = self.sheet_xml.clone();
+            let cur_path = std::mem::take(&mut self.sheet_path);
+            let cur_xml = std::mem::take(&mut self.sheet_xml);
             if !cur_path.is_empty() {
-                if let Some(pair) = self.new_files.iter_mut().find(|(p, _)| p == &cur_path) {
-                    pair.1 = cur_xml;
-                } else {
-                    self.new_files.push((cur_path, cur_xml));
-                }
+                self.new_files.insert(cur_path, cur_xml);
             }
         }
 
-        // 2) Найти r:id по имени листа в workbook.xml
+        // 1) Найти r:id по имени листа в workbook.xml
         let mut rdr = Reader::from_reader(self.workbook_xml.as_slice());
         rdr.config_mut().trim_text(true);
 
@@ -535,7 +672,7 @@ impl XlsxEditor {
         let target_rid = target_rid
             .with_context(|| format!("Sheet `{}` not found in workbook.xml", sheet_name))?;
 
-        // 3) По r:id найти Target в workbook.xml.rels
+        // 2) По r:id найти Target в workbook.xml.rels
         let mut rdr = Reader::from_reader(self.rels_xml.as_slice());
         rdr.config_mut().trim_text(true);
 
@@ -578,40 +715,169 @@ impl XlsxEditor {
             )
         })?;
 
-        // Собираем абсолютный путь внутри архива
+        // 3) Абсолютный путь внутри архива
         let new_sheet_path = if target_rel.starts_with("xl/") {
             target_rel.clone()
         } else {
             format!("xl/{}", target_rel)
         };
 
-        // 4) Достаём XML листа: сперва смотрим в new_files, иначе читаем из ZIP
-        // 4) Достаём XML листа: сперва new_files, потом кэш, иначе из ZIP
-        let sheet_xml: Vec<u8> =
-            if let Some((_, content)) = self.new_files.iter().find(|(p, _)| p == &new_sheet_path) {
-                content.clone()
-            } else if let Some(buf) = self.loaded_files.get(&new_sheet_path) {
-                buf.clone()
-            } else {
-                let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
-                let mut f = zin
-                    .by_name(&new_sheet_path)
-                    .with_context(|| format!("{} not found in zip", new_sheet_path))?;
-                let mut buf = Vec::with_capacity(f.size() as usize);
-                f.read_to_end(&mut buf)?;
-                self.loaded_files
-                    .insert(new_sheet_path.clone(), buf.clone()); // ← кэшируем
-                buf
-            };
+        // 4) Берём XML листа: new_files → loaded_files → zip
+        let sheet_xml: Vec<u8> = if let Some(content) = self.new_files.get(&new_sheet_path) {
+            content.clone()
+        } else if let Some(buf) = self.loaded_files.get(&new_sheet_path) {
+            buf.clone()
+        } else {
+            let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
+            let mut f = zin
+                .by_name(&new_sheet_path)
+                .with_context(|| format!("{} not found in zip", new_sheet_path))?;
+            let mut buf = Vec::with_capacity(f.size() as usize);
+            f.read_to_end(&mut buf)?;
+            self.loaded_files
+                .insert(new_sheet_path.clone(), buf.clone()); // кэшируем
+            buf
+        };
 
-        // 5) Пересчитываем last_row
+        // 5) Пересчитываем last_row и переключаемся
         let last_row = calc_last_row(&sheet_xml);
 
-        // 6) Переключаемся
         self.sheet_path = new_sheet_path;
         self.sheet_xml = sheet_xml;
         self.last_row = last_row;
 
+        Ok(self)
+    }
+}
+
+impl XlsxEditor {
+    pub fn rename_worksheet(&mut self, old_name: &str, new_name: &str) -> Result<&mut Self> {
+        if old_name == new_name {
+            return Ok(self);
+        }
+        // запретим коллизию имён
+        let names = scan(&self.src_path)?;
+        if names.iter().any(|n| n == new_name) {
+            anyhow::bail!("Sheet `{}` already exists", new_name);
+        }
+
+        // парсим <sheets> и меняем имя
+        let (s_start, s_end, mut tags) = parse_sheets_inner(&self.workbook_xml)?;
+        let mut found = false;
+        for t in &mut tags {
+            if t.name == old_name {
+                t.name = new_name.to_string();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            anyhow::bail!("Sheet `{}` not found", old_name);
+        }
+
+        // собираем обратно (sheetId не трогаем при rename)
+        let new_inner = build_sheets_inner(&tags, /*renumber=*/ false);
+        self.workbook_xml.splice(s_start..s_end, new_inner);
+
+        Ok(self)
+    }
+}
+
+impl XlsxEditor {
+    pub fn delete_worksheet(&mut self, name: &str) -> Result<&mut Self> {
+        // 0) r:id по имени
+        let Some(rid) = get_sheet_rid_by_name(&self.workbook_xml, name) else {
+            anyhow::bail!("Sheet `{}` not found in workbook.xml", name);
+        };
+
+        // 1) удалить из списка <sheets> (и тут же пере-нумеровать sheetId подряд)
+        let (s_start, s_end, mut tags) = parse_sheets_inner(&self.workbook_xml)?;
+        let orig_len = tags.len();
+        tags.retain(|t| t.name != name);
+        if tags.len() == orig_len {
+            anyhow::bail!("Sheet `{}` tag not found in <sheets>", name);
+        }
+        let new_inner = build_sheets_inner(&tags, /*renumber=*/ true);
+        self.workbook_xml.splice(s_start..s_end, new_inner);
+
+        // 2) убрать Relationship и получить Target
+        let Some((rel_start, rel_end, target)) = find_relationship_by_id(&self.rels_xml, &rid)
+        else {
+            anyhow::bail!("Relationship `{}` not found in workbook.xml.rels", rid);
+        };
+        self.rels_xml.splice(rel_start..rel_end, std::iter::empty());
+
+        // 3) отметить файл на удаление + вычистить кэши
+        let abs_path = if target.starts_with("xl/") {
+            target.clone()
+        } else {
+            format!("xl/{}", target)
+        };
+        self.removed_files.insert(abs_path.clone());
+        self.new_files.remove(&abs_path);
+        self.loaded_files.remove(&abs_path);
+
+        // 4) если удалили активный лист — переключиться на первый оставшийся (или создать новый)
+        if self.sheet_path == abs_path {
+            // найдём первый r:id оставшегося листа
+            let mut rdr = quick_xml::Reader::from_reader(self.workbook_xml.as_slice());
+            rdr.config_mut().trim_text(true);
+            let mut next_rid: Option<String> = None;
+            while let Ok(ev) = rdr.read_event() {
+                if let quick_xml::events::Event::Empty(ref e)
+                | quick_xml::events::Event::Start(ref e) = ev
+                {
+                    if e.name().as_ref() == b"sheet" {
+                        for a in e.attributes().with_checks(false).flatten() {
+                            if a.key.as_ref() == b"r:id" {
+                                next_rid = Some(String::from_utf8_lossy(&a.value).into_owned());
+                                break;
+                            }
+                        }
+                        if next_rid.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if matches!(ev, quick_xml::events::Event::Eof) {
+                    break;
+                }
+            }
+
+            if let Some(nrid) = next_rid {
+                if let Some((_, _, t)) = find_relationship_by_id(&self.rels_xml, &nrid) {
+                    let p = if t.starts_with("xl/") {
+                        t
+                    } else {
+                        format!("xl/{}", t)
+                    };
+                    let sheet_xml: Vec<u8> = if let Some(c) = self.new_files.get(&p) {
+                        c.clone()
+                    } else if let Some(buf) = self.loaded_files.get(&p) {
+                        buf.clone()
+                    } else {
+                        let mut zin = zip::ZipArchive::new(std::fs::File::open(&self.src_path)?)?;
+                        let mut f = zin
+                            .by_name(&p)
+                            .with_context(|| format!("{} not found in zip", p))?;
+                        let mut buf = Vec::with_capacity(f.size() as usize);
+                        use std::io::Read;
+                        f.read_to_end(&mut buf)?;
+                        self.loaded_files.insert(p.clone(), buf.clone());
+                        buf
+                    };
+                    self.sheet_path = p;
+                    self.sheet_xml = sheet_xml;
+                    self.last_row = calc_last_row(&self.sheet_xml);
+                } else {
+                    self.add_worksheet("Sheet1")?;
+                }
+            } else {
+                self.add_worksheet("Sheet1")?;
+            }
+        }
+
+        // 5) чистка Content_Types перенесена в save(), как раньше
         Ok(self)
     }
 }
@@ -662,11 +928,152 @@ fn normalize_styles_root(xml: &mut Vec<u8>) {
                     let chunk: Vec<u8> = xml[nf_abs..nf_end].to_vec();
                     xml.splice(nf_abs..nf_end, std::iter::empty());
                     // вставляем внутрь корня (см. логику из пункта 1/2)
-                    let root = memmem::find(&xml, b"<styleSheet").unwrap();
-                    let insert = find_bytes_from(&xml, b">", root).unwrap() + 1;
+                    let root = memmem::find(xml, b"<styleSheet").unwrap();
+                    let insert = find_bytes_from(xml, b">", root).unwrap() + 1;
                     xml.splice(insert..insert, chunk.into_iter());
                 }
             }
         }
     }
+}
+
+
+// вытащить r:id листа по его имени
+fn get_sheet_rid_by_name(wb_xml: &[u8], target_name: &str) -> Option<String> {
+    let (s_start, s_end) = XlsxEditor::find_sheets_section(wb_xml).ok()?;
+    let slice = &wb_xml[s_start..s_end];
+    let mut rdr = Reader::from_reader(slice);
+    rdr.config_mut().trim_text(true);
+    while let Ok(ev) = rdr.read_event() {
+        if let Event::Empty(ref e) | Event::Start(ref e) = ev {
+            if e.name().as_ref() == b"sheet" {
+                let mut name = None;
+                let mut rid = None;
+                for a in e.attributes().with_checks(false).flatten() {
+                    let k = a.key.as_ref();
+                    let v = String::from_utf8_lossy(&a.value).into_owned();
+                    if k == b"name" {
+                        name = Some(v.clone());
+                    }
+                    if k == b"r:id" {
+                        rid = Some(v);
+                    }
+                }
+                if let (Some(n), Some(r)) = (name, rid) {
+                    if n == target_name {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+        if matches!(ev, Event::Eof) {
+            break;
+        }
+    }
+    None
+}
+
+// найти Relationship по rId и вернуть (абсол.начало, абсол.конец, target)
+fn find_relationship_by_id(rels_xml: &[u8], rid: &str) -> Option<(usize, usize, String)> {
+    let mut rdr = Reader::from_reader(rels_xml);
+    rdr.config_mut().trim_text(true);
+
+    // грубо ищем подпоследовательность Id="rid"
+    let needle = format!(r#"Id="{}""#, rid);
+    let pos = memmem::find(rels_xml, needle.as_bytes())?;
+    // откатимся назад до начала тега <Relationship
+    let rel_start = memmem::rfind(&rels_xml[..pos], b"<Relationship")?;
+    let rel_end = find_bytes_from(rels_xml, b">", rel_start).map(|p| p + 1)?;
+    // достанем Target
+    let tag = &rels_xml[rel_start..rel_end];
+    let tkey = b" Target=\"";
+    if let Some(t0) = memmem::find(tag, tkey) {
+        let v0 = rel_start + t0 + tkey.len();
+        let v1 = find_bytes_from(rels_xml, b"\"", v0)?;
+        let target = String::from_utf8_lossy(&rels_xml[v0..v1]).into_owned();
+        return Some((rel_start, rel_end, target));
+    }
+    None
+}
+
+fn remove_ct_override_for_path(ct_xml: &mut Vec<u8>, part_abs_path: &str) {
+    // part_abs_path должен начинаться с "xl/..."
+    let part = format!("/{}", part_abs_path);
+    let needle = format!(r#"PartName="{}""#, part);
+    while let Some(attr_pos) = memmem::find(&ct_xml, needle.as_bytes()) {
+        // откатимся к началу тега "<Override"
+        let tag_start = memmem::rfind(&ct_xml[..attr_pos], b"<Override").unwrap_or(attr_pos);
+        // и найдём конец '>'
+        let tag_end = find_bytes_from(&ct_xml, b">", attr_pos)
+            .map(|p| p + 1)
+            .unwrap_or(attr_pos);
+        ct_xml.splice(tag_start..tag_end, std::iter::empty());
+    }
+}
+#[derive(Debug, Clone)]
+struct SheetTagMini {
+    name: String,
+    rid: String,
+    sheet_id: String, // сохраняем как строку: Excel не обязан идти по порядку; при delete можно перенумеровать
+}
+
+// распарсить содержимое между <sheets>...</sheets> в вектор SheetTagMini
+fn parse_sheets_inner(wb_xml: &[u8]) -> anyhow::Result<(usize, usize, Vec<SheetTagMini>)> {
+    let (s_start, s_end) = XlsxEditor::find_sheets_section(wb_xml)?;
+    let slice = &wb_xml[s_start..s_end];
+
+    let mut rdr = quick_xml::Reader::from_reader(slice);
+    rdr.config_mut().trim_text(true);
+
+    let mut out = Vec::<SheetTagMini>::new();
+    while let Ok(ev) = rdr.read_event() {
+        match ev {
+            quick_xml::events::Event::Empty(ref e) | quick_xml::events::Event::Start(ref e)
+                if e.name().as_ref() == b"sheet" =>
+            {
+                let mut name = None;
+                let mut rid = None;
+                let mut sid = None;
+                for a in e.attributes().with_checks(false).flatten() {
+                    let k = a.key.as_ref();
+                    let v = String::from_utf8_lossy(&a.value).into_owned();
+                    if k == b"name" {
+                        name = Some(v.clone());
+                    } else if k == b"r:id" {
+                        rid = Some(v.clone());
+                    } else if k == b"sheetId" {
+                        sid = Some(v.clone());
+                    }
+                }
+                out.push(SheetTagMini {
+                    name: name.unwrap_or_default(),
+                    rid: rid.unwrap_or_default(),
+                    sheet_id: sid.unwrap_or_else(|| "0".to_string()),
+                });
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok((s_start, s_end, out))
+}
+
+// собрать новый inner <sheets> из массива SheetTagMini (с контролем sheetId)
+fn build_sheets_inner(tags: &[SheetTagMini], renumber: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (i, t) in tags.iter().enumerate() {
+        let sid = if renumber {
+            (i as u32 + 1).to_string()
+        } else {
+            t.sheet_id.clone()
+        };
+        let line = format!(
+            "\n  <sheet name=\"{}\" sheetId=\"{}\" r:id=\"{}\"/>",
+            xml_escape(&t.name),
+            sid,
+            t.rid
+        );
+        buf.extend_from_slice(line.as_bytes());
+    }
+    buf
 }
