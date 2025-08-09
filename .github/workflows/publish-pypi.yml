@@ -1,0 +1,79 @@
+name: Build & publish (maturin, polars)
+
+permissions:
+  contents: write
+  id-token: write   # нужно для Trusted Publishing на PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.2)'
+        required: true
+  push:
+    tags: ["v*.*.*"]   # можно выпускать релиз пушем тега
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Собираем колёса в manylinux/macos universal2/Windows
+      - name: Build wheels + sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          manylinux: "2_28"             # корректные manylinux колёса
+          command: build
+          args: >
+            --release
+            --sdist
+            --universal2
+            -m python-bindings/Cargo.toml
+            --features polars
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: target/wheels/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version || github.ref_name }}
+          name: Release v${{ inputs.version || github.ref_name }}
+          files: dist/*
+
+      # Публикация на PyPI:
+      # Вариант A (рекомендовано): Trusted Publishing (OIDC) — без токена
+      - name: Publish to PyPI (Trusted Publisher)
+        if: always()
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --skip-existing dist/*    # можно и target/wheels/*
+          token: pypi
+
+      # Вариант B: через токен, если не включишь Trusted Publishing
+      # - name: Publish to PyPI (API token)
+      #   if: false
+      #   uses: PyO3/maturin-action@v1
+      #   env:
+      #     MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      #   with:
+      #     command: upload
+      #     args: --skip-existing dist/*
