@@ -22,3 +22,9 @@ dependencies = ["pyarrow>=20"]
 
 [tool.maturin]
 bindings = "pyo3"
+module-name = "excelsior"
+include = [
+    "excelsior/__init__.pyi",
+    "excelsior/excelsior.pyi",
+    "excelsior/py.typed", # опционально
+]
