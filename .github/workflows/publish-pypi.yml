@@ -98,16 +98,28 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Flatten dists
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release-dist
+          shopt -s nullglob globstar
+          for f in dist/**/*.whl dist/**/*.tar.gz; do
+            cp "$f" release-dist/
+          done
+          ls -l release-dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version || github.ref_name }}
           name: Release v${{ inputs.version || github.ref_name }}
-          files: dist/*
+          files: release-dist/*
 
       - name: Publish to PyPI (Trusted Publisher)
         uses: PyO3/maturin-action@v1
         with:
           command: upload
-          args: --skip-existing dist/*
+          args: --skip-existing release-dist/*
           token: pypi
+          
