@@ -3,7 +3,7 @@ requires = ["maturin>=1.9"]
 build-backend = "maturin"
 
 [project]
-name = "excelsior"
+name = "excelsior-fast"
 dynamic = ["version"]
 description = "Blazingly fast append to xlsx file"
 readme = { file = "README.md", content-type = "text/markdown" }
