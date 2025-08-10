@@ -8,50 +8,55 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.1.2)'
+        description: 'Release version (e.g. 0.10.0)'
         required: true
   push:
-    tags: ["v*.*.*"]   # релиз пушем тега
+    tags: ["v*.*.*"]
 
 jobs:
   build:
     strategy:
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10','3.11','3.12','3.13']
         include:
+          # only for Linux we set manylinux and allow sdist on one job
           - os: ubuntu-latest
             manylinux: "2_28"
-            target: ""
-            sdist: true
           - os: windows-latest
             manylinux: ""
-            target: ""
-            sdist: false
           - os: macos-latest
             manylinux: ""
-            target: "universal2-apple-darwin"
-            sdist: false
-
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # Linux: wheels + sdist (manylinux)
-      - name: Build wheels (+sdist on Linux)
+      # На Windows/macOS нам нужен выбранный интерпретатор
+      - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Linux: wheels (manylinux); sdist собираем ровно один раз (на 3.13)
+      - name: Build wheels (+sdist once) [Linux]
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: stable
           command: build
-          manylinux: ${{ matrix.manylinux }}     # 2_28
+          manylinux: ${{ matrix.manylinux }}      # 2_28
+          # строим ровно под одну версию из матрицы
           args: >
             --release
-            --sdist
             -m python-bindings/Cargo.toml
             --features polars
+            -i python${{ matrix['python-version'] }}
+            ${{ matrix['python-version'] == '3.13' && '--sdist' || '' }}
 
-      # Windows: только wheels
-      - name: Build wheels (Windows)
+      # Windows: wheels
+      - name: Build wheels [Windows]
         if: runner.os == 'Windows'
         uses: PyO3/maturin-action@v1
         with:
@@ -62,8 +67,8 @@ jobs:
             -m python-bindings/Cargo.toml
             --features polars
 
-      # macOS: universal2 wheels (без --universal2 в args!)
-      - name: Build wheels (macOS universal2)
+      # macOS: universal2 wheels
+      - name: Build wheels [macOS universal2]
         if: runner.os == 'macOS'
         uses: PyO3/maturin-action@v1
         with:
@@ -77,8 +82,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
-          path: target/wheels/*
+          name: wheels-${{ matrix.os }}-py${{ matrix['python-version'] }}
+          path: |
+            target/wheels/*
+            # sdist (только из одного Linux/3.13-джоба)
+            dist/*.tar.gz
 
   release:
     needs: build
@@ -97,19 +105,9 @@ jobs:
           name: Release v${{ inputs.version || github.ref_name }}
           files: dist/*
 
-      # PyPI: Trusted Publishing (OIDC)
       - name: Publish to PyPI (Trusted Publisher)
         uses: PyO3/maturin-action@v1
         with:
           command: upload
           args: --skip-existing dist/*
           token: pypi
-
-      # Альтернатива через API-токен:
-      # - name: Publish to PyPI (API token)
-      #   uses: PyO3/maturin-action@v1
-      #   env:
-      #     MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-      #   with:
-      #     command: upload
-      #     args: --skip-existing dist/*

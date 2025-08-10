@@ -186,7 +186,6 @@ impl StyleIndex {
         rdr.config_mut().trim_text(true);
         let mut in_fonts = false;
         let mut font_id = 0u32;
-
         while let Ok(ev) = rdr.read_event() {
             match ev {
                 Event::Start(ref e) if e.name().as_ref() == b"fonts" => in_fonts = true,
