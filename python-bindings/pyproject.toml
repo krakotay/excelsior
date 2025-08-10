@@ -14,13 +14,11 @@ keywords = ["excel", "xlsx", "rust", "append"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Rust",
-    "License :: OSI Approved :: GPL-3.0 License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: OS Independent",
 ]
 urls = { Homepage = "https://github.com/krakotay/excelsior", Issues = "https://github.com/krakotay/excelsior/issues" }
-dependencies = [
-    "pyarrow>=20"        # или без версии: "pyarrow"
-]
+dependencies = ["pyarrow>=20"]
 
 [tool.maturin]
 bindings = "pyo3"
