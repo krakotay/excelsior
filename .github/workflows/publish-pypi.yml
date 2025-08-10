@@ -2,7 +2,7 @@ name: Build & publish (maturin, polars)
 
 permissions:
   contents: write
-  id-token: write   # нужно для Trusted Publishing на PyPI
+  id-token: write   # для Trusted Publishing на PyPI
 
 on:
   workflow_dispatch:
@@ -11,28 +11,67 @@ on:
         description: 'Release version (e.g. 0.1.2)'
         required: true
   push:
-    tags: ["v*.*.*"]   # можно выпускать релиз пушем тега
+    tags: ["v*.*.*"]   # релиз пушем тега
 
 jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            manylinux: "2_28"
+            target: ""
+            sdist: true
+          - os: windows-latest
+            manylinux: ""
+            target: ""
+            sdist: false
+          - os: macos-latest
+            manylinux: ""
+            target: "universal2-apple-darwin"
+            sdist: false
+
     runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
 
-      # Собираем колёса в manylinux/macos universal2/Windows
-      - name: Build wheels + sdist
+      # Linux: wheels + sdist (manylinux)
+      - name: Build wheels (+sdist on Linux)
+        if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: stable
-          manylinux: "2_28"             # корректные manylinux колёса
           command: build
+          manylinux: ${{ matrix.manylinux }}     # 2_28
           args: >
             --release
             --sdist
-            --universal2
+            -m python-bindings/Cargo.toml
+            --features polars
+
+      # Windows: только wheels
+      - name: Build wheels (Windows)
+        if: runner.os == 'Windows'
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          args: >
+            --release
+            -m python-bindings/Cargo.toml
+            --features polars
+
+      # macOS: universal2 wheels (без --universal2 в args!)
+      - name: Build wheels (macOS universal2)
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          target: universal2-apple-darwin
+          args: >
+            --release
             -m python-bindings/Cargo.toml
             --features polars
 
@@ -58,19 +97,16 @@ jobs:
           name: Release v${{ inputs.version || github.ref_name }}
           files: dist/*
 
-      # Публикация на PyPI:
-      # Вариант A (рекомендовано): Trusted Publishing (OIDC) — без токена
+      # PyPI: Trusted Publishing (OIDC)
       - name: Publish to PyPI (Trusted Publisher)
-        if: always()
         uses: PyO3/maturin-action@v1
         with:
           command: upload
-          args: --skip-existing dist/*    # можно и target/wheels/*
+          args: --skip-existing dist/*
           token: pypi
 
-      # Вариант B: через токен, если не включишь Trusted Publishing
+      # Альтернатива через API-токен:
       # - name: Publish to PyPI (API token)
-      #   if: false
       #   uses: PyO3/maturin-action@v1
       #   env:
       #     MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
