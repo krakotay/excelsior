@@ -1,11 +1,7 @@
-#[cfg(feature = "polars")]
 use crate::{XlsxEditor, find_bytes_from};
-#[cfg(feature = "polars")]
 use anyhow::{Context, Result};
-#[cfg(feature = "polars")]
 use polars_core::prelude::*;
 
-#[cfg(feature = "polars")]
 impl XlsxEditor {
     pub fn with_polars(&mut self, df: &DataFrame, start_cell: Option<&str>) -> Result<()> {
         use crate::style::{col_letter, split_coord};

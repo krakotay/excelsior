@@ -5,10 +5,7 @@ use pyo3::PyRefMut;
 use pyo3::types::PyDict;
 use rust_core::{XlsxEditor, scan};
 use std::path::PathBuf;
-
-#[cfg(feature = "polars")]
 use pyo3_polars::PyDataFrame;
-#[cfg(feature = "polars")]
 fn index_to_excel_col(mut idx: usize) -> String {
     let mut col = String::new();
     idx += 1; // 1-based
@@ -41,9 +38,9 @@ impl PyAlignSpec {
     #[new]
     #[pyo3(signature = (horiz = None, vert = None, wrap = false))]
     fn new(
-        py: Python<'_>,          // <--- Запрашиваем доступ к GIL
-        horiz: Option<PyObject>, // <--- Принимаем PyObject
-        vert: Option<PyObject>,  // <--- Принимаем PyObject
+        py: Python<'_>,              // <--- Запрашиваем доступ к GIL
+        horiz: Option<Py<PyAny>>, // <--- Принимаем PyObject
+        vert: Option<Py<PyAny>>,  // <--- Принимаем PyObject
         wrap: bool,
     ) -> PyResult<Self> {
         // Извлекаем .value из горизонтального выравнивания, если оно есть
@@ -177,13 +174,12 @@ impl Editor {
             .save(path)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
-    #[cfg(feature = "polars")]
-    #[pyo3(signature = (py_df, start_cell = None, default_width = 15.0))]
+    #[pyo3(signature = (py_df, start_cell = None))]
     fn with_polars(
         &mut self,
         py_df: PyDataFrame,
         start_cell: Option<String>,
-        default_width: f64,
+        // default_width: f64,
     ) -> PyResult<()> {
         let df = py_df.into();
         let start = start_cell.as_deref();
@@ -191,22 +187,24 @@ impl Editor {
             .with_polars(&df, start)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // --- Вот тут автоприменяем ширину к столбцам ---
-        // Определяем имена столбцов из DataFrame (через polars)
-        let columns: Vec<String> = df
-            .get_column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // Remove for Fixing error
 
-        // Вставляем ширину для каждого столбца
-        for col in &columns {
-            // Можно сделать функцию для конвертации индекса столбца в Excel-букву, если нужно
-            let col_letter = index_to_excel_col(columns.iter().position(|c| c == col).unwrap());
-            self.editor
-                .set_column_width(&col_letter, default_width)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
+        // // --- Вот тут автоприменяем ширину к столбцам ---
+        // // Определяем имена столбцов из DataFrame (через polars)
+        // let columns: Vec<String> = df
+        //     .get_column_names()
+        //     .iter()
+        //     .map(|s| s.to_string())
+        //     .collect();
+
+        // // Вставляем ширину для каждого столбца
+        // for col in &columns {
+        //     // Можно сделать функцию для конвертации индекса столбца в Excel-букву, если нужно
+        //     let col_letter = index_to_excel_col(columns.iter().position(|c| c == col).unwrap());
+        //     self.editor
+        //         .set_column_width(&col_letter, default_width)
+        //         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // }
 
         Ok(())
     }
@@ -305,6 +303,16 @@ impl Editor {
                 .set_column_width(col_letter, width)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
+        Ok(slf)
+    }
+
+    fn remove_style<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        range: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.editor
+            .remove_style(range)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
 }

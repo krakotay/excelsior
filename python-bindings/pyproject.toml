@@ -18,7 +18,14 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 urls = { Homepage = "https://github.com/krakotay/excelsior", Issues = "https://github.com/krakotay/excelsior/issues" }
-dependencies = ["pyarrow>=20"]
+dependencies = [
+    "numpy>=2.2.6",
+    "openpyxl>=3.1.5",
+    "pip>=25.3",
+    "polars==1.35.*",
+    "pyarrow>=20",
+    "pywin32>=311",
+]
 
 [tool.maturin]
 bindings = "pyo3"

@@ -220,8 +220,8 @@ fn rename_del_worksheet() -> Result<()> {
     Ok(())
 }
 
+
 #[test]
-#[cfg(feature = "polars")]
 fn test_write_polars() -> Result<()> {
     use polars_core::prelude::*;
 

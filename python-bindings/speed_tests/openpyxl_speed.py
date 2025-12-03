@@ -11,7 +11,7 @@ alignment = Alignment(horizontal="center", vertical="center")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
-wb = openpyxl.open(os.path.join(base_dir, "../tests/100mb.xlsx"))
+wb = openpyxl.open(os.path.join(base_dir, "../../test/100mb.xlsx"))
 ws = wb['Tablo3']
 def generate_table(width: int, height: int):
     table = [['a' + str(i + j) * 10 for i in range(width)] for j in range(height)]

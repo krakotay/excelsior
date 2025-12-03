@@ -2,7 +2,7 @@ from excelsior import Editor, HorizAlignment, AlignSpec
 import os
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
-editor = Editor(os.path.join(base_dir, "../tests/100mb.xlsx"), "Tablo3")
+editor = Editor(os.path.join(base_dir, "../../test/100mb.xlsx"), "Tablo3")
 def generate_table(width: int, height: int):
     table = [['a' + str(i + j) * 10 for i in range(width)] for j in range(height)]
     return table
