@@ -51,7 +51,6 @@ jobs:
           args: >
             --release
             -m python-bindings/Cargo.toml
-            --features polars
             -i python${{ matrix['python-version'] }}
             ${{ matrix['python-version'] == '3.13' && '--sdist' || '' }}
 
@@ -65,7 +64,6 @@ jobs:
           args: >
             --release
             -m python-bindings/Cargo.toml
-            --features polars
 
       # macOS: universal2 wheels
       - name: Build wheels [macOS universal2]
@@ -78,7 +76,6 @@ jobs:
           args: >
             --release
             -m python-bindings/Cargo.toml
-            --features polars
 
       - uses: actions/upload-artifact@v4
         with:
