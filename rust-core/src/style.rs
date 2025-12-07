@@ -603,13 +603,12 @@ impl XlsxEditor {
         )?;
         Ok(self)
     }
-
-    /// Removes any styling from the specified range, leaving only the cell contents.
     pub fn remove_style(&mut self, range: &str) -> Result<&mut Self> {
         match parse_target(range)? {
             Target::Cell(cell) => self.remove_style_from_cell(&cell)?,
             Target::Rect { c0, r0, c1, r1 } => self.remove_style_rect(c0, r0, c1, r1)?,
-            _ => bail!("Row/Col-level styling not implemented yet"),
+            Target::Col(c) => self.remove_style_col(c)?,
+            Target::Row(r) => self.remove_style_row(r)?,
         }
         Ok(self)
     }
@@ -1733,6 +1732,240 @@ impl XlsxEditor {
                 self.remove_style_from_cell(&coord)?;
             }
         }
+        Ok(())
+    }
+}
+
+impl XlsxEditor {
+    /// Удалить стиль из всех ячеек указанной строки (row-level syntax: "12:").
+    fn remove_style_row(&mut self, row: u32) -> Result<()> {
+        let src = std::mem::take(&mut self.sheet_xml);
+        let mut dst = Vec::with_capacity(src.len());
+
+        let find_row = memmem::Finder::new(b"<row ");
+        let find_gt = memmem::Finder::new(b">");
+        let find_cell_open = memmem::Finder::new(b"<c ");
+        let find_cell_selfclose = memmem::Finder::new(b"<c/");
+
+        let mut i = 0usize;
+
+        while let Some(off) = find_row.find(&src[i..]) {
+            let row_start = i + off;
+            // всё до <row ...> — как есть
+            dst.extend_from_slice(&src[i..row_start]);
+
+            // конец открывающего тега <row ...>
+            let row_tag_end =
+                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
+
+            // r="..."
+            let mut row_r: Option<u32> = None;
+            if let Some(pos) = find_bytes_from(&src, b" r=\"", row_start) {
+                if pos < row_tag_end {
+                    let v0 = pos + 4;
+                    if let Some(v1) = find_bytes_from(&src, b"\"", v0) {
+                        row_r = lexical_core::parse::<u32>(&src[v0..v1]).ok();
+                    }
+                }
+            }
+
+            let row_end =
+                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
+            let row_close_end = row_end + "</row>".len();
+
+            let Some(cur_row) = row_r else {
+                // без номера — просто копируем
+                dst.extend_from_slice(&src[row_start..row_close_end]);
+                i = row_close_end;
+                continue;
+            };
+
+            if cur_row != row {
+                // чужая строка — копируем как есть
+                dst.extend_from_slice(&src[row_start..row_close_end]);
+                i = row_close_end;
+                continue;
+            }
+
+            // Это наша строка → копируем заголовок <row ...>
+            dst.extend_from_slice(&src[row_start..=row_tag_end]);
+
+            // Обрабатываем содержимое до </row>, вычищая s="..."
+            let mut j = row_tag_end + 1;
+            while j < row_end {
+                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
+                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
+                let next_cell = match (next_open, next_sc) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+
+                match next_cell {
+                    None => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) if cpos >= row_end => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) => {
+                        // всё до <c ...>
+                        dst.extend_from_slice(&src[j..cpos]);
+
+                        let tag_end =
+                            find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
+                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
+
+                        let mut cell_tag = src[cpos..=tag_end].to_vec();
+
+                        // внутри тега убираем атрибут s="..."
+                        if let Some(sattr) = find_bytes_from(&cell_tag, b" s=\"", 0) {
+                            // ищем закрывающую кавычку
+                            if let Some(val_end) = find_bytes_from(&cell_tag, b"\"", sattr + 4) {
+                                // удаляем s="...": до включая кавычку
+                                let remove_end = val_end + 1;
+                                cell_tag.drain(sattr..remove_end);
+                            }
+                        }
+
+                        dst.extend_from_slice(&cell_tag);
+
+                        if self_closing {
+                            j = tag_end + 1;
+                        } else {
+                            // содержимое ячейки до </c> — просто копируем
+                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
+                                .context("</c> missing")?;
+                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
+                            j = c_close + 4;
+                        }
+                    }
+                }
+            }
+
+            // закрытие строки
+            dst.extend_from_slice(&src[row_end..row_close_end]);
+            i = row_close_end;
+        }
+
+        // хвост (после последней строки)
+        dst.extend_from_slice(&src[i..]);
+
+        self.sheet_xml = dst;
+        Ok(())
+    }
+
+    /// Удалить стиль из всех ячеек указанного столбца (col-level syntax: "A:", "C:").
+    /// col0 — 0-based индекс столбца.
+    fn remove_style_col(&mut self, col0: u32) -> Result<()> {
+        let src = std::mem::take(&mut self.sheet_xml);
+        let mut dst = Vec::with_capacity(src.len());
+
+        let find_row = memmem::Finder::new(b"<row ");
+        let find_gt = memmem::Finder::new(b">");
+        let find_cell_open = memmem::Finder::new(b"<c ");
+        let find_cell_selfclose = memmem::Finder::new(b"<c/");
+
+        let mut i = 0usize;
+
+        while let Some(off) = find_row.find(&src[i..]) {
+            let row_start = i + off;
+            // всё до <row ...> — как есть
+            dst.extend_from_slice(&src[i..row_start]);
+
+            let row_tag_end =
+                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
+
+            let row_end =
+                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
+            let row_close_end = row_end + "</row>".len();
+
+            // копируем заголовок <row ...>
+            dst.extend_from_slice(&src[row_start..=row_tag_end]);
+
+            let mut j = row_tag_end + 1;
+            while j < row_end {
+                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
+                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
+                let next_cell = match (next_open, next_sc) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+
+                match next_cell {
+                    None => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) if cpos >= row_end => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) => {
+                        dst.extend_from_slice(&src[j..cpos]);
+
+                        let tag_end =
+                            find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
+                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
+
+                        let mut cell_tag = src[cpos..=tag_end].to_vec();
+
+                        // r="A12" → вычисляем индекс столбца
+                        let mut col_idx: Option<u32> = None;
+                        if let Some(rpos) = find_bytes_from(&cell_tag, b" r=\"", 0) {
+                            let v0 = rpos + 4;
+                            if let Some(v1) = find_bytes_from(&cell_tag, b"\"", v0) {
+                                let val = &cell_tag[v0..v1];
+                                if let Some(p) = val.iter().position(|b| b.is_ascii_digit()) {
+                                    let mut ci: u32 = 0;
+                                    for &b in &val[..p] {
+                                        let u = (b as char).to_ascii_uppercase() as u8;
+                                        ci = ci * 26 + ((u - b'A') as u32 + 1);
+                                    }
+                                    col_idx = Some(ci - 1);
+                                }
+                            }
+                        }
+
+                        // если это наш столбец — убираем s="..."
+                        if col_idx == Some(col0) {
+                            if let Some(sattr) = find_bytes_from(&cell_tag, b" s=\"", 0) {
+                                if let Some(val_end) =
+                                    find_bytes_from(&cell_tag, b"\"", sattr + 4)
+                                {
+                                    let remove_end = val_end + 1;
+                                    cell_tag.drain(sattr..remove_end);
+                                }
+                            }
+                        }
+
+                        dst.extend_from_slice(&cell_tag);
+
+                        if self_closing {
+                            j = tag_end + 1;
+                        } else {
+                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
+                                .context("</c> missing")?;
+                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
+                            j = c_close + 4;
+                        }
+                    }
+                }
+            }
+
+            dst.extend_from_slice(&src[row_end..row_close_end]);
+            i = row_close_end;
+        }
+
+        // хвост после последнего <row>
+        dst.extend_from_slice(&src[i..]);
+
+        self.sheet_xml = dst;
         Ok(())
     }
 }

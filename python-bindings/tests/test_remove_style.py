@@ -7,6 +7,7 @@ from excel_check import (
     assert_excel_file,
     check_font_range,
     check_font_not_range,
+    check_borders_thin
 )
 
 
@@ -35,6 +36,7 @@ editor.set_font("D4:D8", "Arial", 12.0, True, False).set_border(
     True,
     AlignSpec(horiz=HorizAlignment.Center),
 ).merge_cells("B12:D12")
+editor.set_border('G1:H10', 'thin')
 editor.save(str(styled_out))
 
 # Проверяем, что стили действительно применены
@@ -50,11 +52,12 @@ assert_excel_file(
         True,
         horiz=XL_CENTER,
     ),
+    lambda ws: check_borders_thin(ws, 'G1:H10')
 )
 
 # 2) Снимаем стили с этих же диапазонов и сохраняем во второй файл
-editor.remove_style("A1:D2")
-    # .remove_style('B:').remove_style('C:').remove_style('D:')
+editor = editor.remove_style("A1:D2")\
+    .remove_style('G:')
 editor.save(str(cleared_out))
 
 # Проверяем, что диапазоны больше НЕ имеют тех же стилей
@@ -70,4 +73,8 @@ assert_excel_file(
         True,
         horiz=XL_CENTER,
     ),
+    lambda ws: check_borders_thin(ws, 'G1:G10') # Должно выдать ошибку
+
 )
+print(cleared_out)
+print('Done')
