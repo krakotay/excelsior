@@ -24,7 +24,7 @@ dependencies = [
     "pip>=25.3",
     "polars==1.35.*",
     "pyarrow>=20",
-    "pywin32>=311",
+    "pywin32>=311; sys_platform == 'win32'",
 ]
 
 [tool.maturin]
