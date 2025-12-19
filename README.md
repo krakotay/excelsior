@@ -4,7 +4,7 @@
 
 [pypi link](https://pypi.org/project/excelsior-fast/)
 
-A small project for quickly modifying `.xlsx` workbooks from Rust or Python.
+A small project for quickly modifying `.xlsx` workbooks from Rust or Python. Can be 200+ times faster [than openpyxl](/python-bindings/speed_tests/speed-test-polars-openpyxl-excelsior-0.11.3.md). 
 It consists of two crates:
 
 * **rust-core** – the core library that works directly with spreadsheet XML.
