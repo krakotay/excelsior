@@ -33,3 +33,6 @@ editor.with_polars(df) # THIS WILL NOT CHANGE FORMATTING OF EXISTING CELLS!
 editor.save(os.path.join(base_dir, "100mb_excelsior_polars.xlsx"))
 
 ```
+
+![Before](image_before.png)
+![After](image_after.png)
