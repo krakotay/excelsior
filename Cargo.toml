@@ -1,0 +1,11 @@
+# [package] section removed – this is a virtual workspace manifest
+
+[workspace]
+members = ["rust-core", "python-bindings"]
+resolver = "3"
+
+[workspace.package]
+version  = "0.11.3"
+edition  = "2024"
+license  = "GPL-3.0"
+

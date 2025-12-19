@@ -1,0 +1,17 @@
+[package]
+name = "excelsior"
+version.workspace  = true   
+edition.workspace  = true   
+[lib]
+name = "excelsior"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.26.0", features = ["extension-module"] }
+rust-core = { path = "../rust-core", default-features = true}
+anyhow = "1.0.100"
+pyo3-polars = { version = "0.25.0" }
+
+# [features]
+# default = ["rust-core/polars"]
+# polars = []

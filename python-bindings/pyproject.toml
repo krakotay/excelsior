@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.9"]
+build-backend = "maturin"
+
+[project]
+name = "excelsior-fast"
+dynamic = ["version"]
+description = "Blazingly fast append to xlsx file"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Mihail Boreyko", email = "krakotay@yandex.ru" }]
+keywords = ["excel", "xlsx", "rust", "append"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+]
+urls = { Homepage = "https://github.com/krakotay/excelsior", Issues = "https://github.com/krakotay/excelsior/issues" }
+dependencies = [
+    "numpy>=2.2.6",
+    "openpyxl>=3.1.5",
+    "pip>=25.3",
+    "polars==1.35.*",
+    "pyarrow>=20",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "excelsior"
+include = [
+    "excelsior/__init__.pyi",
+    "excelsior/excelsior.pyi",
+    "excelsior/py.typed", # опционально
+]

@@ -1,0 +1,122 @@
+name: Build & publish (maturin, polars)
+
+permissions:
+  contents: write
+  id-token: write   # для Trusted Publishing на PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.10.0)'
+        required: true
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10','3.11','3.12','3.13']
+        include:
+          # only for Linux we set manylinux and allow sdist on one job
+          - os: ubuntu-latest
+            manylinux: "2_28"
+          - os: windows-latest
+            manylinux: ""
+          - os: macos-latest
+            manylinux: ""
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # На Windows/macOS нам нужен выбранный интерпретатор
+      - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Linux: wheels (manylinux); sdist собираем ровно один раз (на 3.13)
+      - name: Build wheels (+sdist once) [Linux]
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          manylinux: ${{ matrix.manylinux }}      # 2_28
+          # строим ровно под одну версию из матрицы
+          args: >
+            --release
+            -m python-bindings/Cargo.toml
+            -i python${{ matrix['python-version'] }}
+            ${{ matrix['python-version'] == '3.13' && '--sdist' || '' }}
+
+      # Windows: wheels
+      - name: Build wheels [Windows]
+        if: runner.os == 'Windows'
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          args: >
+            --release
+            -m python-bindings/Cargo.toml
+
+      # macOS: universal2 wheels
+      - name: Build wheels [macOS universal2]
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: stable
+          command: build
+          target: universal2-apple-darwin
+          args: >
+            --release
+            -m python-bindings/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix['python-version'] }}
+          path: |
+            target/wheels/*
+            # sdist (только из одного Linux/3.13-джоба)
+            dist/*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Flatten dists
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release-dist
+          shopt -s nullglob globstar
+          for f in dist/**/*.whl dist/**/*.tar.gz; do
+            cp "$f" release-dist/
+          done
+          ls -l release-dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version || github.ref_name }}
+          name: Release v${{ inputs.version || github.ref_name }}
+          files: release-dist/*
+
+      - name: Publish to PyPI (Trusted Publisher)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --skip-existing release-dist/*
+          token: pypi
+          
