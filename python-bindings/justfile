@@ -5,3 +5,11 @@ speed-rust:
 
 speed-style v="":
 	cd speed_tests && hyperfine "python excelsior_speed_style.py"  --export-markdown speed-test-style-{{v}}.md -M 3
+
+
+speed-polars-excelsior v="":
+	cd speed_tests && hyperfine "python excelsior_speed_polars.py"  --export-markdown speed-test-polars-excelsior-{{v}}.md -M 3
+speed-polars-openpyxl v="":
+	cd speed_tests && hyperfine "python openpyxl_speed_polars.py"  --export-markdown speed-test-polars-openpyxl-{{v}}.md -M 3
+speed-polars-openpyxl-excelsior v="":
+	cd speed_tests && hyperfine "python openpyxl_speed_polars.py" "python excelsior_speed_polars.py"  --export-markdown speed-test-polars-openpyxl-excelsior-{{v}}.md -M 3

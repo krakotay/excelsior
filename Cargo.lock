@@ -252,7 +252,7 @@ checksum = "ca81e6b4777c89fd810c25a4be2b1bd93ea034fbe58e6a75216a34c6b82c539b"
 
 [[package]]
 name = "excelsior"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -968,7 +968,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "rust-core"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "lexical-core",
