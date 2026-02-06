@@ -21,9 +21,11 @@ urls = { Homepage = "https://github.com/krakotay/excelsior", Issues = "https://g
 dependencies = [
     "numpy>=2.2.6",
     "openpyxl>=3.1.5",
+    "patchelf>=0.17.2.4",
     "pip>=25.3",
     "polars==1.35.*",
     "pyarrow>=20",
+    "pytest>=9.0.2",
 ]
 
 [tool.maturin]

@@ -11,6 +11,7 @@ pyo3 = { version = "0.26.0", features = ["extension-module"] }
 rust-core = { path = "../rust-core", default-features = true}
 anyhow = "1.0.100"
 pyo3-polars = { version = "0.25.0" }
+zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
 # [features]
 # default = ["rust-core/polars"]

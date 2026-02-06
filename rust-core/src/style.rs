@@ -138,6 +138,36 @@ fn parse_target(s: &str) -> Result<Target> {
     bail!("invalid range syntax: {s}");
 }
 
+fn parse_open_column_selector(s: &str) -> Option<(u32, u32)> {
+    if !s.ends_with(':') {
+        return None;
+    }
+    let head = &s[..s.len() - 1];
+    if head.is_empty() {
+        return None;
+    }
+    if head.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Some((col_index(head) as u32, 1));
+    }
+
+    let p = head.find(|c: char| c.is_ascii_digit())?;
+    if p == 0 {
+        return None;
+    }
+    if !head[..p].bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !head[p..].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let row_start = head[p..].parse::<u32>().ok()?;
+    if row_start == 0 {
+        return None;
+    }
+    Some((col_index(&head[..p]) as u32, row_start))
+}
+
 impl StyleIndex {
     fn build(styles: &[u8]) -> Result<Self> {
         let mut ix = StyleIndex {
@@ -594,6 +624,19 @@ impl XlsxEditor {
     }
 
     pub fn set_alignment(&mut self, range: &str, align: &AlignSpec) -> Result<&mut Self> {
+        if let Some((col0, row_start)) = parse_open_column_selector(range) {
+            let patch = StyleParts {
+                align: Some(align.clone()),
+                ..Default::default()
+            };
+            self.apply_patch_col_one_pass(col0, row_start, &patch)?;
+            if row_start == 1 {
+                let default_sid = self.ensure_style_from_parts(&patch)?;
+                self.set_column_properties(col0, None, Some(default_sid))?;
+            }
+            return Ok(self);
+        }
+
         self.apply_patch(
             range,
             StyleParts {
@@ -914,6 +957,93 @@ impl XlsxEditor {
             dst.extend_from_slice(cell_tag.as_bytes());
         }
         dst.extend_from_slice(b"</row>");
+    }
+
+    fn apply_patch_col_one_pass(
+        &mut self,
+        col0: u32,
+        row_start: u32,
+        patch: &StyleParts,
+    ) -> Result<()> {
+        let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
+        let col = col_letter(col0).to_ascii_uppercase();
+        let col_bytes = col.as_bytes();
+
+        let src = std::mem::take(&mut self.sheet_xml);
+        let mut dst = Vec::with_capacity(src.len() + 256);
+
+        let mut i = 0usize;
+        let finder = memmem::Finder::new(b"<c");
+
+        while let Some(off) = finder.find(&src[i..]) {
+            let start = i + off;
+            dst.extend_from_slice(&src[i..start]);
+
+            let next = *src.get(start + 2).unwrap_or(&b'>');
+            let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
+            let tag_end = find_bytes_from(&src, b">", start).context("cell tag end")? + 1;
+
+            if !is_cell {
+                dst.extend_from_slice(&src[start..tag_end]);
+                i = tag_end;
+                continue;
+            }
+
+            let mut cell = src[start..tag_end].to_vec();
+            let mut in_target_col = false;
+
+            if let Some(rpos) = find_bytes_from(&cell, b" r=\"", 0) {
+                let v0 = rpos + 4;
+                if let Some(v1) = find_bytes_from(&cell, b"\"", v0) {
+                    let val = &cell[v0..v1];
+                    let col_len = col_bytes.len();
+                    if val.len() > col_len
+                        && val[..col_len]
+                            .iter()
+                            .map(|b| b.to_ascii_uppercase())
+                            .eq(col_bytes.iter().copied())
+                        && val[col_len..].iter().all(|b| b.is_ascii_digit())
+                    {
+                        if let Ok(row_num) = lexical_core::parse::<u32>(&val[col_len..]) {
+                            if row_num >= row_start {
+                                in_target_col = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if in_target_col {
+                let old_sid = if let Some(sp) = find_bytes_from(&cell, b" s=\"", 0) {
+                    let s0 = sp + 4;
+                    let s1 = find_bytes_from(&cell, b"\"", s0 + 1).context("style quote")?;
+                    lexical_core::parse::<u32>(&cell[s0..s1]).ok()
+                } else {
+                    None
+                };
+                let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch);
+
+                if let Some(sp) = find_bytes_from(&cell, b" s=\"", 0) {
+                    let s0 = sp + 4;
+                    let s1 = find_bytes_from(&cell, b"\"", s0 + 1).context("style quote")?;
+                    cell.splice(s0..s1, new_sid.to_string().bytes());
+                } else {
+                    let ins = if cell.len() >= 2 && cell[cell.len() - 2] == b'/' {
+                        cell.len() - 2
+                    } else {
+                        cell.len() - 1
+                    };
+                    cell.splice(ins..ins, format!(r#" s="{}""#, new_sid).bytes());
+                }
+            }
+
+            dst.extend_from_slice(&cell);
+            i = tag_end;
+        }
+
+        dst.extend_from_slice(&src[i..]);
+        self.sheet_xml = dst;
+        Ok(())
     }
 }
 

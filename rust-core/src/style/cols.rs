@@ -115,7 +115,7 @@ impl XlsxEditor {
                             } else {
                                 cell.len() - 1
                             };
-                            cell.splice(ins..ins, format!(r#" s=\"{}\""#, sid).bytes());
+                            cell.splice(ins..ins, format!(r#" s="{}""#, sid).bytes());
                         }
                     }
                 }
@@ -155,7 +155,7 @@ impl XlsxEditor {
                 (dim_end, 0)
             } else {
                 // создаём минимальный dimension прямо перед sheetData
-                let dim_tag = r#"<dimension ref=\"A1\"/>"#.as_bytes();
+                let dim_tag = r#"<dimension ref="A1"/>"#.as_bytes();
                 self.sheet_xml
                     .splice(sd_pos..sd_pos, dim_tag.iter().copied());
                 (sd_pos + dim_tag.len(), dim_tag.len())
@@ -256,21 +256,21 @@ impl XlsxEditor {
 }
 
 fn build_one_col_tag(min: u32, max: u32, p: &ColProp) -> String {
-    let mut s = format!(r#"<col min=\"{min}\" max=\"{max}\""#);
+    let mut s = format!(r#"<col min="{min}" max="{max}""#);
     if let Some(w) = p.width {
-        s.push_str(&format!(r#" width=\"{w}\""#));
+        s.push_str(&format!(r#" width="{w}""#));
         if p.custom_width {
-            s.push_str(r#" customWidth=\"1\""#);
+            s.push_str(r#" customWidth="1""#);
         }
     }
     if let Some(st) = p.style {
-        s.push_str(&format!(r#" style=\"{st}\""#));
+        s.push_str(&format!(r#" style="{st}""#));
     }
     if p.best_fit {
-        s.push_str(r#" bestFit=\"1\""#);
+        s.push_str(r#" bestFit="1""#);
     }
     if p.hidden {
-        s.push_str(r#" hidden=\"1\""#);
+        s.push_str(r#" hidden="1""#);
     }
     s.push_str("/>");
     s

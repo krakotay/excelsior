@@ -1,4 +1,4 @@
-set shell := ["pwsh.exe", "-c"]
+# set shell := ["pwsh.exe", "-c"]
 
 build POLARS="":
     python-bindings\.venv\Scripts\activate

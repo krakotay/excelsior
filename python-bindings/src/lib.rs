@@ -1,14 +1,17 @@
+use pyo3::PyRefMut;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-
-use pyo3::PyRefMut;
 use pyo3::types::PyDict;
-use rust_core::{XlsxEditor, scan};
-use std::path::PathBuf;
 use pyo3_polars::PyDataFrame;
+use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
+use rust_core::{XlsxEditor, scan};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use zip::write::FileOptions;
+
 fn index_to_excel_col(mut idx: usize) -> String {
     let mut col = String::new();
-    idx += 1; // 1-based
+    idx += 1;
     while idx > 0 {
         let rem = (idx - 1) % 26;
         col.insert(0, (b'A' + rem as u8) as char);
@@ -16,10 +19,211 @@ fn index_to_excel_col(mut idx: usize) -> String {
     }
     col
 }
-// Импортируем типы из rust_core
-use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
 
-// --- ОБЕРТКИ ДЛЯ ENUM-ОВ ---
+fn excel_col_to_index(col: &str) -> PyResult<usize> {
+    let mut idx = 0usize;
+    let up = col.trim().to_ascii_uppercase();
+    if up.is_empty() || !up.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(PyRuntimeError::new_err(format!(
+            "Invalid Excel column: {col}"
+        )));
+    }
+    for b in up.bytes() {
+        idx = idx * 26 + (b - b'A' + 1) as usize;
+    }
+    Ok(idx - 1)
+}
+
+fn normalize_column_letter(col: &str) -> PyResult<String> {
+    let normalized = col.trim().to_ascii_uppercase();
+    if normalized.is_empty() || !normalized.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(PyRuntimeError::new_err(format!(
+            "Invalid Excel column: {col}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn expand_column_selector(selector: &str) -> PyResult<Vec<String>> {
+    let trimmed = selector.trim();
+    if let Some((start, end)) = trimmed.split_once(':') {
+        let start_idx = excel_col_to_index(start)?;
+        let end_idx = excel_col_to_index(end)?;
+        if start_idx > end_idx {
+            return Err(PyRuntimeError::new_err(format!(
+                "Invalid column range: {selector}"
+            )));
+        }
+        Ok((start_idx..=end_idx).map(index_to_excel_col).collect())
+    } else {
+        Ok(vec![normalize_column_letter(trimmed)?])
+    }
+}
+
+fn validate_width(width: f64) -> PyResult<f64> {
+    if !width.is_finite() || width <= 0.0 || width > 255.0 {
+        return Err(PyRuntimeError::new_err(
+            "Column width must be in range (0, 255]",
+        ));
+    }
+    Ok(width)
+}
+
+fn normalize_sheet_name(sheet_name: &str) -> PyResult<String> {
+    let normalized = sheet_name.trim();
+    if normalized.is_empty() {
+        return Err(PyRuntimeError::new_err("Sheet name cannot be empty"));
+    }
+    if normalized.len() > 31 {
+        return Err(PyRuntimeError::new_err(
+            "Sheet name cannot be longer than 31 characters",
+        ));
+    }
+    if normalized
+        .chars()
+        .any(|c| matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
+    {
+        return Err(PyRuntimeError::new_err(
+            "Sheet name contains forbidden Excel characters (: \\ / ? * [ ])",
+        ));
+    }
+    Ok(normalized.to_owned())
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+}
+
+fn create_empty_excel_file(path: &Path, sheet_name: &str) -> PyResult<()> {
+    let sheet_name = normalize_sheet_name(sheet_name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+
+    let file = File::create(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"#;
+
+    let rels_root = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
+    let workbook = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+  <sheets>\
+    <sheet name=\"{}\" sheetId=\"1\" r:id=\"rId1\"/>\
+  </sheets>\
+</workbook>",
+        xml_escape_attr(&sheet_name)
+    );
+
+    let workbook_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+
+    let sheet1 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData></sheetData>
+</worksheet>"#;
+
+    let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1">
+    <font>
+      <sz val="11"/>
+      <color theme="1"/>
+      <name val="Calibri"/>
+      <family val="2"/>
+    </font>
+  </fonts>
+  <fills count="2">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+  </fills>
+  <borders count="1">
+    <border>
+      <left/><right/><top/><bottom/><diagonal/>
+    </border>
+  </borders>
+  <cellStyleXfs count="1">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+  </cellStyleXfs>
+  <cellXfs count="1">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+  </cellXfs>
+  <cellStyles count="1">
+    <cellStyle name="Normal" xfId="0" builtinId="0"/>
+  </cellStyles>
+</styleSheet>"#;
+
+    zip.start_file("[Content_Types].xml", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, content_types.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.start_file("_rels/.rels", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, rels_root.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.start_file("xl/workbook.xml", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, workbook.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.start_file("xl/_rels/workbook.xml.rels", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, workbook_rels.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.start_file("xl/worksheets/sheet1.xml", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, sheet1.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.start_file("xl/styles.xml", options)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    std::io::Write::write_all(&mut zip, styles.as_bytes())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    zip.finish()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(())
+}
+
+fn open_editor_with_optional_sheet(path: PathBuf, sheet_name: Option<&str>) -> PyResult<Editor> {
+    let sheet = match sheet_name {
+        Some(name) => normalize_sheet_name(name)?,
+        None => scan(&path)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| PyRuntimeError::new_err("Workbook contains no worksheets"))?,
+    };
+
+    let opened =
+        XlsxEditor::open(path, &sheet).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(Editor { editor: opened })
+}
 
 #[pyclass(name = "HorizAlignment")]
 #[derive(Clone)]
@@ -38,26 +242,20 @@ impl PyAlignSpec {
     #[new]
     #[pyo3(signature = (horiz = None, vert = None, wrap = false))]
     fn new(
-        py: Python<'_>,              // <--- Запрашиваем доступ к GIL
-        horiz: Option<Py<PyAny>>, // <--- Принимаем PyObject
-        vert: Option<Py<PyAny>>,  // <--- Принимаем PyObject
+        py: Python<'_>,
+        horiz: Option<Py<PyAny>>,
+        vert: Option<Py<PyAny>>,
         wrap: bool,
     ) -> PyResult<Self> {
-        // Извлекаем .value из горизонтального выравнивания, если оно есть
         let h_opt = if let Some(h_obj) = horiz {
-            // "Привязываем" PyObject к GIL, чтобы работать с ним
             let h_any = h_obj.bind(py);
-            // Получаем атрибут .value
             let h_value = h_any.getattr("value")?;
-            // Извлекаем из .value нашу Rust-структуру
             let py_h: PyRef<PyHorizAlignment> = h_value.extract()?;
-            // Клонируем внутренние данные
             Some(py_h.0.clone())
         } else {
             None
         };
 
-        // То же самое для вертикального
         let v_opt = if let Some(v_obj) = vert {
             let v_any = v_obj.bind(py);
             let v_value = v_any.getattr("value")?;
@@ -67,7 +265,6 @@ impl PyAlignSpec {
             None
         };
 
-        // Создаем и возвращаем финальную структуру
         Ok(Self(AlignSpec {
             horiz: h_opt,
             vert: v_opt,
@@ -75,10 +272,18 @@ impl PyAlignSpec {
         }))
     }
 }
+
 #[pyfunction]
 fn scan_excel(path: PathBuf) -> PyResult<Vec<String>> {
     scan(&path).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
+
+#[pyfunction]
+#[pyo3(signature = (path, sheet_name = "Sheet1"))]
+fn create_excel(path: PathBuf, sheet_name: &str) -> PyResult<()> {
+    create_empty_excel_file(&path, sheet_name)
+}
+
 #[pyclass]
 struct Editor {
     editor: XlsxEditor,
@@ -87,56 +292,78 @@ struct Editor {
 #[pymethods]
 impl Editor {
     #[new]
-    #[pyo3(signature = (path, sheet_name))]
-    fn new(path: PathBuf, sheet_name: &str) -> PyResult<Self> {
-        let openned = XlsxEditor::open(path, sheet_name)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Editor { editor: openned })
+    #[pyo3(signature = (path, sheet_name = None))]
+    fn new(path: PathBuf, sheet_name: Option<&str>) -> PyResult<Self> {
+        open_editor_with_optional_sheet(path, sheet_name)
     }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, sheet_name = "Sheet1"))]
+    fn create(path: PathBuf, sheet_name: &str) -> PyResult<Self> {
+        create_empty_excel_file(&path, sheet_name)?;
+        open_editor_with_optional_sheet(path, Some(sheet_name))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, sheet_name = None))]
+    fn open(path: PathBuf, sheet_name: Option<&str>) -> PyResult<Self> {
+        open_editor_with_optional_sheet(path, sheet_name)
+    }
+
     fn add_worksheet<'py>(
         mut slf: PyRefMut<'py, Self>,
         sheet_name: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let normalized = normalize_sheet_name(sheet_name)?;
         slf.editor
-            .add_worksheet(sheet_name)
+            .add_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn add_worksheet_at<'py>(
         mut slf: PyRefMut<'py, Self>,
         sheet_name: &str,
         index: usize,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let normalized = normalize_sheet_name(sheet_name)?;
         slf.editor
-            .add_worksheet_at(sheet_name, index)
+            .add_worksheet_at(&normalized, index)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn with_worksheet<'py>(
         mut slf: PyRefMut<'py, Self>,
         sheet_name: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let normalized = normalize_sheet_name(sheet_name)?;
         slf.editor
-            .with_worksheet(sheet_name)
+            .with_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn rename_worksheet<'py>(
         mut slf: PyRefMut<'py, Self>,
         old_name: &str,
         new_name: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let old_name = normalize_sheet_name(old_name)?;
+        let new_name = normalize_sheet_name(new_name)?;
         slf.editor
-            .rename_worksheet(old_name, new_name)
+            .rename_worksheet(&old_name, &new_name)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn delete_worksheet<'py>(
         mut slf: PyRefMut<'py, Self>,
         sheet_name: &str,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let normalized = normalize_sheet_name(sheet_name)?;
         slf.editor
-            .delete_worksheet(sheet_name)
+            .delete_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
@@ -158,11 +385,13 @@ impl Editor {
             .append_table_at(start_cell, cells)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
+
     fn last_row_index(&mut self, col_name: String) -> PyResult<u32> {
         self.editor
             .get_last_row_index(&col_name)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
+
     fn last_rows_index(&mut self, col_name: String) -> PyResult<Vec<u32>> {
         self.editor
             .get_last_roww_index(&col_name)
@@ -174,40 +403,17 @@ impl Editor {
             .save(path)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
+
     #[pyo3(signature = (py_df, start_cell = None))]
-    fn with_polars(
-        &mut self,
-        py_df: PyDataFrame,
-        start_cell: Option<String>,
-        // default_width: f64,
-    ) -> PyResult<()> {
+    fn with_polars(&mut self, py_df: PyDataFrame, start_cell: Option<String>) -> PyResult<()> {
         let df = py_df.into();
         let start = start_cell.as_deref();
         self.editor
             .with_polars(&df, start)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // Remove for Fixing error
-
-        // // --- Вот тут автоприменяем ширину к столбцам ---
-        // // Определяем имена столбцов из DataFrame (через polars)
-        // let columns: Vec<String> = df
-        //     .get_column_names()
-        //     .iter()
-        //     .map(|s| s.to_string())
-        //     .collect();
-
-        // // Вставляем ширину для каждого столбца
-        // for col in &columns {
-        //     // Можно сделать функцию для конвертации индекса столбца в Excel-букву, если нужно
-        //     let col_letter = index_to_excel_col(columns.iter().position(|c| c == col).unwrap());
-        //     self.editor
-        //         .set_column_width(&col_letter, default_width)
-        //         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        // }
-
         Ok(())
     }
+
     fn set_number_format<'py>(
         mut slf: PyRefMut<'py, Self>,
         range: &str,
@@ -229,6 +435,7 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     #[pyo3(signature = (range, name, size, bold = false, italic = false, align = None))]
     fn set_font<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -237,14 +444,13 @@ impl Editor {
         size: f32,
         bold: bool,
         italic: bool,
-        align: Option<PyAlignSpec>, // <--- ИЗМЕНЕНО: принимаем PyAlignSpec
+        align: Option<PyAlignSpec>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let editor = &mut slf.editor;
 
-        // Конвертируем PyAlignSpec в rust_core::AlignSpec вручную
         if let Some(py_align_spec) = align {
             editor
-                .set_font_with_alignment(range, name, size, bold, italic, &py_align_spec.0) // <--- ИЗМЕНЕНО: используем .0
+                .set_font_with_alignment(range, name, size, bold, italic, &py_align_spec.0)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         } else {
             editor
@@ -257,13 +463,14 @@ impl Editor {
     fn set_alignment<'py>(
         mut slf: PyRefMut<'py, Self>,
         range: &str,
-        spec: PyAlignSpec, // <--- ИЗМЕНЕНО: принимаем PyAlignSpec
+        spec: PyAlignSpec,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.editor
-            .set_alignment(range, &spec.0) // <--- ИЗМЕНЕНО: используем .0
+            .set_alignment(range, &spec.0)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn merge_cells<'py>(
         mut slf: PyRefMut<'py, Self>,
         range: &str,
@@ -273,6 +480,7 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn set_border<'py>(
         mut slf: PyRefMut<'py, Self>,
         range: &str,
@@ -283,25 +491,63 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
     fn set_column_width<'py>(
         mut slf: PyRefMut<'py, Self>,
         col_letter: &str,
         width: f64,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        let normalized = normalize_column_letter(col_letter)?;
+        let width = validate_width(width)?;
         slf.editor
-            .set_column_width(col_letter, width)
+            .set_column_width(&normalized, width)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(slf)
     }
+
+    fn set_column_width_range<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        col_range: &str,
+        width: f64,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let width = validate_width(width)?;
+        for col in expand_column_selector(col_range)? {
+            slf.editor
+                .set_column_width(&col, width)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        Ok(slf)
+    }
+
     fn set_columns_width<'py>(
         mut slf: PyRefMut<'py, Self>,
         col_letters: Vec<String>,
         width: f64,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        for col_letter in col_letters.iter() {
-            slf.editor
-                .set_column_width(col_letter, width)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let width = validate_width(width)?;
+        for selector in &col_letters {
+            for col in expand_column_selector(selector)? {
+                slf.editor
+                    .set_column_width(&col, width)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+        }
+        Ok(slf)
+    }
+
+    fn set_column_widths<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        widths: &Bound<'_, PyDict>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        for (key, value) in widths.iter() {
+            let selector: String = key.extract()?;
+            let width: f64 = value.extract()?;
+            let width = validate_width(width)?;
+            for col in expand_column_selector(&selector)? {
+                slf.editor
+                    .set_column_width(&col, width)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
         }
         Ok(slf)
     }
@@ -316,23 +562,26 @@ impl Editor {
         Ok(slf)
     }
 }
+
 #[pyclass]
 struct Scanner {
     path: PathBuf,
 }
+
 #[pymethods]
 impl Scanner {
     #[new]
     fn new(path: PathBuf) -> PyResult<Self> {
         Ok(Scanner { path })
     }
+
     fn get_sheets(&self) -> PyResult<Vec<String>> {
         scan_excel(self.path.clone()).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
-    fn open_editor(&self, sheet_name: String) -> PyResult<Editor> {
-        let openned = XlsxEditor::open(self.path.clone(), &sheet_name)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Editor { editor: openned })
+
+    #[pyo3(signature = (sheet_name = None))]
+    fn open_editor(&self, sheet_name: Option<&str>) -> PyResult<Editor> {
+        open_editor_with_optional_sheet(self.path.clone(), sheet_name)
     }
 }
 
@@ -341,13 +590,10 @@ fn excelsior(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Editor>()?;
     m.add_class::<Scanner>()?;
     m.add_function(wrap_pyfunction!(scan_excel, m)?)?;
+    m.add_function(wrap_pyfunction!(create_excel, m)?)?;
 
-    // --- РЕГИСТРАЦИЯ НОВЫХ КЛАССОВ И ENUM-ОВ ---
-
-    // 1. Добавляем класс AlignSpec
     m.add_class::<PyAlignSpec>()?;
 
-    // 2. Создаем Python Enum для HorizAlignment
     let horiz_enum = py.import("enum")?.getattr("Enum")?;
     let horiz_members = PyDict::new(py);
     horiz_members.set_item("Left", PyHorizAlignment(HorizAlignment::Left))?;
@@ -358,7 +604,6 @@ fn excelsior(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let horiz_cls = horiz_enum.call1(("HorizAlignment", horiz_members))?;
     m.add("HorizAlignment", horiz_cls)?;
 
-    // 3. Создаем Python Enum для VertAlignment
     let vert_enum = py.import("enum")?.getattr("Enum")?;
     let vert_members = PyDict::new(py);
     vert_members.set_item("Top", PyVertAlignment(VertAlignment::Top))?;
