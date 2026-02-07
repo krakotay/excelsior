@@ -2,12 +2,18 @@ use pyo3::PyRefMut;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use pyo3_polars::PyDataFrame;
 use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
 use rust_core::{XlsxEditor, scan};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use zip::write::FileOptions;
+
+fn py_value_to_excel_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if value.is_none() {
+        return Ok(String::new());
+    }
+    Ok(value.str()?.to_str()?.to_owned())
+}
 
 fn index_to_excel_col(mut idx: usize) -> String {
     let mut col = String::new();
@@ -405,11 +411,37 @@ impl Editor {
     }
 
     #[pyo3(signature = (py_df, start_cell = None))]
-    fn with_polars(&mut self, py_df: PyDataFrame, start_cell: Option<String>) -> PyResult<()> {
-        let df = py_df.into();
-        let start = start_cell.as_deref();
+    fn with_polars(
+        &mut self,
+        py: Python<'_>,
+        py_df: &Bound<'_, PyAny>,
+        start_cell: Option<String>,
+    ) -> PyResult<()> {
+        let columns: Vec<String> = py_df
+            .getattr("columns")
+            .map_err(|_| PyRuntimeError::new_err("Expected polars.DataFrame with .columns"))?
+            .extract()?;
+
+        let rows_iter = py_df
+            .call_method0("iter_rows")
+            .map_err(|_| PyRuntimeError::new_err("Expected polars.DataFrame with .iter_rows()"))?;
+
+        let mut table: Vec<Vec<String>> = Vec::new();
+        table.push(columns);
+
+        for row in rows_iter.try_iter()? {
+            let row_any = row?;
+            let row_values: Vec<Py<PyAny>> = row_any.extract()?;
+            let mut out_row = Vec::with_capacity(row_values.len());
+            for value in row_values {
+                out_row.push(py_value_to_excel_string(value.bind(py).as_any())?);
+            }
+            table.push(out_row);
+        }
+
+        let start = start_cell.as_deref().unwrap_or("A1");
         self.editor
-            .with_polars(&df, start)
+            .append_table_at(start, table)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(())
     }

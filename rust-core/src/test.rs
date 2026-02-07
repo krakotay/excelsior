@@ -219,21 +219,3 @@ fn rename_del_worksheet() -> Result<()> {
 
     Ok(())
 }
-
-
-#[test]
-fn test_write_polars() -> Result<()> {
-    use polars_core::prelude::*;
-
-    let file_name = "../test/test.xlsx"; // Шаблон53. РД Выборка.xlsx result.xlsx
-    let sheet_names: Vec<String> = scan(file_name)?;
-    let mut app = XlsxEditor::open(file_name, &sheet_names[0])?;
-    let s1 = Column::new("Fruit".into(), ["Apple", "Apple", "Pear"]);
-    let s2 = Column::new("Color".into(), ["Red", "Yellow", "Green"]);
-
-    let df: DataFrame = DataFrame::new(vec![s1, s2])?;
-    app.with_polars(&df, None)?;
-    app.add_worksheet("Sheet2")?.with_polars(&df, None)?;
-    app.save(file_name.to_owned() + "_appended.xlsx")?;
-    Ok(())
-}

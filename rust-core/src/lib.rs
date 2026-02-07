@@ -4,7 +4,6 @@
 // static GLOBAL: MiMalloc = MiMalloc;
 pub mod files_part;
 use memchr::memmem;
-mod polars_part;
 mod read_part;
 pub mod style;
 mod test;
