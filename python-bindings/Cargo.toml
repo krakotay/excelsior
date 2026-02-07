@@ -9,9 +9,5 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.28.0", features = ["extension-module"] }
 rust-core = { path = "../rust-core", default-features = true}
-anyhow = "1.0.100"
-zip = { version = "7.4.0", default-features = false, features = ["deflate"] }
-
-# [features]
-# default = ["rust-core/polars"]
-# polars = []
+zip.workspace = true
+anyhow.workspace = true
