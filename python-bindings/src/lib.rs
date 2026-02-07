@@ -231,15 +231,15 @@ fn open_editor_with_optional_sheet(path: PathBuf, sheet_name: Option<&str>) -> P
     Ok(Editor { editor: opened })
 }
 
-#[pyclass(name = "HorizAlignment")]
+#[pyclass(name = "HorizAlignment", from_py_object)]
 #[derive(Clone)]
 struct PyHorizAlignment(HorizAlignment);
 
-#[pyclass(name = "VertAlignment")]
+#[pyclass(name = "VertAlignment", from_py_object)]
 #[derive(Clone)]
 struct PyVertAlignment(VertAlignment);
 
-#[pyclass(name = "AlignSpec")]
+#[pyclass(name = "AlignSpec", from_py_object)]
 #[derive(Clone)]
 struct PyAlignSpec(AlignSpec);
 
