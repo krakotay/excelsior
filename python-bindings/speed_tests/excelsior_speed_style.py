@@ -13,6 +13,7 @@ def generate_table(width: int, height: int):
 
 data = generate_table(5, 2000)
 last_col = max(editor.last_rows_index("A:E")) + 1
+# editor.append_table_at(data, f'A:{last_col}')
 for row in data:
     editor.append_row(row)
 editor.set_font(

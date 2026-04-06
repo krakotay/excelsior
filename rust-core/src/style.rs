@@ -86,10 +86,27 @@ pub struct AlignSpec {
     pub wrap: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontSpec {
+    pub name: String,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyleSpec {
+    pub num_fmt_code: Option<String>,
+    pub font: Option<FontSpec>,
+    pub fill_rgb: Option<String>,
+    pub border_style: Option<String>,
+    pub align: Option<AlignSpec>,
+}
+
 /* ========================== CORE STYLE STRUCT ============================= */
 
 #[derive(Debug, Clone, Default)]
-struct StyleParts {
+pub(crate) struct StyleParts {
     pub num_fmt_code: Option<String>,
     pub font: Option<u32>,
     pub fill: Option<u32>,
@@ -173,6 +190,7 @@ impl StyleIndex {
         let mut ix = StyleIndex {
             xfs: Vec::new(),
             numfmt_by_code: HashMap::new(),
+            numfmt_code_by_id: HashMap::new(),
             next_custom_numfmt: 164,
 
             font_by_key: HashMap::new(),
@@ -204,7 +222,8 @@ impl StyleIndex {
                         }
                     }
                     if let (Some(i), Some(c)) = (id, code) {
-                        ix.numfmt_by_code.insert(c, i);
+                        ix.numfmt_by_code.insert(c.clone(), i);
+                        ix.numfmt_code_by_id.insert(i, c);
                         if i > max_custom {
                             max_custom = i;
                         }
@@ -550,15 +569,64 @@ impl XlsxEditor {
         }
         Ok(self.styles_index.as_mut().unwrap())
     }
-
-    fn invalidate_styles_ix(&mut self) {
-        self.styles_index = None;
-    }
 }
 
 /* ========================== PUBLIC API ==================================== */
 
 impl XlsxEditor {
+    pub fn set_style(&mut self, range: &str, spec: &StyleSpec) -> Result<&mut Self> {
+        let patch = self.build_style_parts(spec)?;
+        if patch.num_fmt_code.is_none()
+            && patch.font.is_none()
+            && patch.fill.is_none()
+            && patch.border.is_none()
+            && patch.align.is_none()
+        {
+            return Ok(self);
+        }
+
+        if let Some((col0, row_start)) = parse_open_column_selector(range) {
+            if patch.num_fmt_code.is_some() || patch.font.is_some() || patch.fill.is_some() || patch.border.is_some() {
+                bail!("open column style patch currently supports alignment or number format via dedicated APIs only");
+            }
+            self.apply_patch_col_one_pass(col0, row_start, &patch)?;
+            if row_start == 1 && patch.align.is_some() {
+                let default_sid = self.ensure_style_from_parts(&patch)?;
+                self.set_column_properties(col0, None, Some(default_sid))?;
+            }
+            return Ok(self);
+        }
+
+        self.apply_patch(range, patch)?;
+        Ok(self)
+    }
+
+    fn build_style_parts(&mut self, spec: &StyleSpec) -> Result<StyleParts> {
+        let font = if let Some(font) = &spec.font {
+            Some(self.ensure_font(&font.name, font.size, font.bold, font.italic)?)
+        } else {
+            None
+        };
+        let fill = if let Some(rgb) = spec.fill_rgb.as_deref() {
+            Some(self.ensure_fill(rgb)?)
+        } else {
+            None
+        };
+        let border = if let Some(style) = spec.border_style.as_deref() {
+            Some(self.ensure_border(style)?)
+        } else {
+            None
+        };
+
+        Ok(StyleParts {
+            num_fmt_code: spec.num_fmt_code.clone(),
+            font,
+            fill,
+            border,
+            align: spec.align.clone(),
+        })
+    }
+
     pub fn set_border(&mut self, range: &str, border_style: &str) -> Result<&mut Self> {
         let border_id = self.ensure_border(border_style)?;
         self.apply_patch(
@@ -658,19 +726,26 @@ impl XlsxEditor {
 
     /// Публичный API для числового формата.
     pub fn set_number_format(&mut self, range: &str, fmt: &str) -> Result<()> {
-        let style_id = self.ensure_style(Some(fmt), None, None, None, None)?;
+        let patch = StyleParts {
+            num_fmt_code: Some(fmt.to_string()),
+            ..Default::default()
+        };
         match parse_target(range)? {
-            Target::Cell(c) => self.apply_style_to_cell(&c, style_id)?,
-            Target::Rect { c0, r0, c1, r1 } => {
-                for r in r0..=r1 {
-                    for c in c0..=c1 {
-                        let coord = format!("{}{}", col_letter(c), r);
-                        self.apply_style_to_cell(&coord, style_id)?;
-                    }
-                }
+            Target::Cell(c) => {
+                let sid = self.cell_style_id(&c)?;
+                let merged = merge_style_parts(self.read_style_parts(sid)?, &patch);
+                let style_id = self.ensure_style_from_parts(&merged)?;
+                self.apply_style_to_cell(&c, style_id)?;
             }
-            Target::Col(c0) => self.force_column_number_format(c0, style_id)?,
-            Target::Row(_row) => bail!("Row-level not implemented yet"),
+            Target::Rect { c0, r0, c1, r1 } => {
+                self.apply_patch_rect_one_pass(c0, r0, c1, r1, &patch)?;
+            }
+            Target::Col(c0) => {
+                self.apply_patch_col_one_pass(c0, 1, &patch)?;
+                let default_sid = self.ensure_style_from_parts(&patch)?;
+                self.set_column_properties(c0, None, Some(default_sid))?;
+            }
+            Target::Row(row) => self.apply_patch_row_one_pass(row, &patch)?,
         }
         Ok(())
     }
@@ -1045,6 +1120,120 @@ impl XlsxEditor {
         self.sheet_xml = dst;
         Ok(())
     }
+
+    fn apply_patch_row_one_pass(&mut self, row_target: u32, patch: &StyleParts) -> Result<()> {
+        let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
+
+        let src = std::mem::take(&mut self.sheet_xml);
+        let mut dst = Vec::with_capacity(src.len() + 256);
+
+        let find_row = memmem::Finder::new(b"<row ");
+        let find_gt = memmem::Finder::new(b">");
+        let find_cell_open = memmem::Finder::new(b"<c ");
+        let find_cell_selfclose = memmem::Finder::new(b"<c/");
+
+        let mut i = 0usize;
+        while let Some(off) = find_row.find(&src[i..]) {
+            let row_start = i + off;
+            dst.extend_from_slice(&src[i..row_start]);
+
+            let row_tag_end =
+                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
+            let row_end =
+                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
+            let row_close_end = row_end + "</row>".len();
+
+            let mut row_r: Option<u32> = None;
+            if let Some(pos) = find_bytes_from(&src, b" r=\"", row_start) {
+                if pos < row_tag_end {
+                    let v0 = pos + 4;
+                    if let Some(v1) = find_bytes_from(&src, b"\"", v0) {
+                        row_r = lexical_core::parse::<u32>(&src[v0..v1]).ok();
+                    }
+                }
+            }
+
+            if row_r != Some(row_target) {
+                dst.extend_from_slice(&src[row_start..row_close_end]);
+                i = row_close_end;
+                continue;
+            }
+
+            dst.extend_from_slice(&src[row_start..=row_tag_end]);
+
+            let mut j = row_tag_end + 1;
+            while j < row_end {
+                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
+                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
+                let next_cell = match (next_open, next_sc) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+
+                match next_cell {
+                    None => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) if cpos >= row_end => {
+                        dst.extend_from_slice(&src[j..row_end]);
+                        break;
+                    }
+                    Some(cpos) => {
+                        dst.extend_from_slice(&src[j..cpos]);
+
+                        let tag_end = find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
+                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
+                        let mut cell_tag = src[cpos..=tag_end].to_vec();
+
+                        let old_sid = if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
+                            let s0 = sp + 4;
+                            let s1 =
+                                find_bytes_from(&cell_tag, b"\"", s0 + 1).context("style quote")?;
+                            lexical_core::parse::<u32>(&cell_tag[s0..s1]).ok()
+                        } else {
+                            None
+                        };
+                        let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch);
+
+                        if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
+                            let s0 = sp + 4;
+                            let s1 =
+                                find_bytes_from(&cell_tag, b"\"", s0 + 1).context("style quote")?;
+                            cell_tag.splice(s0..s1, new_sid.to_string().bytes());
+                        } else {
+                            let ins = if self_closing {
+                                cell_tag.len() - 2
+                            } else {
+                                cell_tag.len() - 1
+                            };
+                            cell_tag.splice(ins..ins, format!(r#" s="{}""#, new_sid).bytes());
+                        }
+
+                        dst.extend_from_slice(&cell_tag);
+
+                        if self_closing {
+                            j = tag_end + 1;
+                        } else {
+                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
+                                .context("</c> missing")?;
+                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
+                            j = c_close + 4;
+                        }
+                    }
+                }
+            }
+
+            dst.extend_from_slice(&src[row_end..row_close_end]);
+            i = row_close_end;
+        }
+
+        dst.extend_from_slice(&src[i..]);
+        self.sheet_xml = dst;
+        Ok(())
+    }
 }
 
 impl XlsxEditor {
@@ -1067,26 +1256,45 @@ impl XlsxEditor {
                 // 2) теперь быстрый проход по существующим c-тегам с мерджем стиля
                 self.apply_patch_rect_one_pass(c0, r0, c1, r1, &patch)?;
             }
-            _ => bail!("Row/Col-level styling not implemented in this snippet"),
+            Target::Col(c0) => self.apply_patch_col_one_pass(c0, 1, &patch)?,
+            Target::Row(row) => self.apply_patch_row_one_pass(row, &patch)?,
         }
         Ok(())
     }
 
-    fn read_style_parts(&self, style_id: Option<u32>) -> Result<StyleParts> {
-        if let Some(sid) = style_id {
-            let (font, fill) = self.xf_components(sid)?;
-            let border = self.xf_border(sid)?;
-            let align = self.xf_alignment(sid)?;
-            Ok(StyleParts {
-                num_fmt_code: None,
-                font,
-                fill,
-                border,
-                align,
-            })
+    pub(crate) fn read_style_parts(&mut self, style_id: Option<u32>) -> Result<StyleParts> {
+        let Some(sid) = style_id else {
+            return Ok(StyleParts::default());
+        };
+
+        let (num_fmt_id, font_id, fill_id, border_id, align) = {
+            let xf = self
+                .style_ix_mut()?
+                .xfs
+                .get(sid as usize)
+                .with_context(|| format!("style id {sid} not found in style index"))?;
+            (
+                xf.num_fmt_id,
+                xf.font_id,
+                xf.fill_id,
+                xf.border_id,
+                xf.align.clone(),
+            )
+        };
+
+        let num_fmt_code = if num_fmt_id == 0 {
+            None
         } else {
-            Ok(StyleParts::default())
-        }
+            self.style_ix_mut()?.numfmt_code_by_id.get(&num_fmt_id).cloned()
+        };
+
+        Ok(StyleParts {
+            num_fmt_code,
+            font: font_id,
+            fill: fill_id,
+            border: border_id,
+            align,
+        })
     }
 }
 
@@ -1276,29 +1484,6 @@ fn merge_style_parts(mut base: StyleParts, patch: &StyleParts) -> StyleParts {
 /* ========================== LOW-LEVEL HELPERS ============================= */
 
 impl XlsxEditor {
-    fn ensure_style(
-        &mut self,
-        num_fmt: Option<&str>,
-        font_id: Option<u32>,
-        fill_id: Option<u32>,
-        border_id: Option<u32>,
-        align: Option<&AlignSpec>,
-    ) -> Result<u32> {
-        let fmt_id: u32 = if let Some(code) = num_fmt {
-            self.ensure_num_fmt(code)?
-        } else {
-            0
-        };
-
-        if align.is_none() {
-            if let Some(id) = self.find_matching_xf(fmt_id, font_id, fill_id, border_id)? {
-                return Ok(id);
-            }
-        }
-
-        self.add_new_xf(fmt_id, font_id, fill_id, border_id, align)
-    }
-
     fn ensure_num_fmt(&mut self, code: &str) -> Result<u32> {
         // A) есть в кеше?
         if let Some(id) = self
@@ -1346,164 +1531,11 @@ impl XlsxEditor {
         {
             let ix = self.style_ix_mut()?;
             ix.numfmt_by_code.insert(code.to_string(), new_id);
+            ix.numfmt_code_by_id.insert(new_id, code.to_string());
             ix.next_custom_numfmt = new_id + 1;
         }
 
         Ok(new_id)
-    }
-
-    fn find_matching_xf(
-        &self,
-        fmt_id: u32,
-        font_id: Option<u32>,
-        fill_id: Option<u32>,
-        border_id: Option<u32>,
-    ) -> Result<Option<u32>> {
-        let mut rdr = Reader::from_reader(self.styles_xml.as_slice());
-        rdr.config_mut().trim_text(true);
-
-        let mut in_xfs = false;
-        let mut idx: u32 = 0;
-
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = false,
-
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref() == b"xf" =>
-                {
-                    // С xf с alignment мы не сравниваем — пропускаем
-                    let mut has_alignment_child = false;
-                    // Event::Start -> значит дальше внутри могут быть теги
-                    if matches!(ev, Event::Start(_)) {
-                        let mut depth = 1;
-                        while depth > 0 {
-                            match rdr.read_event()? {
-                                Event::Start(ref ie) => {
-                                    if ie.name().as_ref() == b"alignment" {
-                                        has_alignment_child = true;
-                                    }
-                                    depth += 1;
-                                }
-                                Event::End(_) => depth -= 1,
-                                Event::Eof => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                    if has_alignment_child {
-                        idx += 1;
-                        continue;
-                    }
-
-                    let mut num = None::<u32>;
-                    let mut fnt = None::<u32>;
-                    let mut fil = None::<u32>;
-                    let mut bdr = None::<u32>;
-                    for a in e.attributes().with_checks(false).flatten() {
-                        match a.key.as_ref() {
-                            b"numFmtId" => num = Some(lexical_core::parse(&a.value)?),
-                            b"fontId" => fnt = Some(lexical_core::parse(&a.value)?),
-                            b"fillId" => fil = Some(lexical_core::parse(&a.value)?),
-                            b"borderId" => bdr = Some(lexical_core::parse(&a.value)?),
-                            _ => {}
-                        }
-                    }
-                    let num_ok = num.unwrap_or(0) == fmt_id;
-                    let font_ok = font_id.map_or(true, |v| Some(v) == fnt);
-                    let fill_ok = fill_id.map_or(true, |v| Some(v) == fil);
-                    let border_ok = border_id.map_or(true, |v| Some(v) == bdr);
-
-                    if num_ok && font_ok && fill_ok && border_ok {
-                        return Ok(Some(idx));
-                    }
-                    idx += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        Ok(None)
-    }
-
-    fn add_new_xf(
-        &mut self,
-        fmt_id: u32,
-        font_id: Option<u32>,
-        fill_id: Option<u32>,
-        border_id: Option<u32>,
-        align: Option<&AlignSpec>,
-    ) -> Result<u32> {
-        let mut xf = String::from("<xf xfId=\"0\" ");
-
-        if let Some(fid) = font_id {
-            xf.push_str(&format!(r#"fontId="{fid}" applyFont="1" "#));
-        }
-        if let Some(fid) = fill_id {
-            xf.push_str(&format!(r#"fillId="{fid}" applyFill="1" "#));
-        }
-        if let Some(bid) = border_id {
-            xf.push_str(&format!(r#"borderId="{bid}" applyBorder="1" "#));
-        }
-        xf.push_str(&format!(
-            r#"numFmtId="{}"{} "#,
-            fmt_id,
-            if fmt_id != 0 {
-                r#" applyNumberFormat="1""#
-            } else {
-                ""
-            }
-        ));
-        if align.is_some() {
-            xf.push_str(r#"applyAlignment="1" "#);
-        }
-        xf.pop();
-        xf.push('>');
-
-        if let Some(al) = align {
-            if al.horiz.is_some() || al.vert.is_some() || al.wrap {
-                xf.push_str("<alignment");
-                if let Some(h) = &al.horiz {
-                    xf.push_str(&format!(r#" horizontal="{}""#, h));
-                }
-                if let Some(v) = &al.vert {
-                    xf.push_str(&format!(r#" vertical="{}""#, v));
-                }
-                if al.wrap {
-                    xf.push_str(r#" wrapText="1""#);
-                }
-                xf.push_str("/>");
-            }
-        }
-        xf.push_str("</xf>");
-
-        let pos = memmem::rfind(&self.styles_xml, b"</cellXfs>")
-            .context("styles.xml: </cellXfs> not found")?;
-        self.styles_xml.splice(pos..pos, xf.bytes());
-        bump_count(&mut self.styles_xml, b"<cellXfs", b"count=\"")?;
-
-        // посчитать индекс нового
-        let mut rdr = Reader::from_reader(self.styles_xml.as_slice());
-        rdr.config_mut().trim_text(true);
-        let mut in_xfs = false;
-        let mut cnt = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => break,
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref() == b"xf" =>
-                {
-                    cnt += 1
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        self.invalidate_styles_ix(); // индекс устаревает — пересоберём при следующем обращении
-
-        Ok(cnt - 1)
     }
 
     fn ensure_font(&mut self, name: &str, size: f32, bold: bool, italic: bool) -> Result<u32> {
@@ -1636,130 +1668,7 @@ impl XlsxEditor {
         Ok(new_id)
     }
 
-    fn xf_components(&self, style_id: u32) -> Result<(Option<u32>, Option<u32>)> {
-        let mut rdr = Reader::from_reader(self.styles_xml.as_slice());
-        rdr.config_mut().trim_text(true);
-        let mut in_xfs = false;
-        let mut idx = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => break,
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref() == b"xf" =>
-                {
-                    if idx == style_id {
-                        let mut font = None;
-                        let mut fill = None;
-                        for a in e.attributes().with_checks(false).flatten() {
-                            match a.key.as_ref() {
-                                b"fontId" => font = Some(lexical_core::parse(&a.value)?),
-                                b"fillId" => fill = Some(lexical_core::parse(&a.value)?),
-                                _ => {}
-                            }
-                        }
-                        return Ok((font, fill));
-                    }
-                    idx += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        Ok((None, None))
-    }
-
-    fn xf_border(&self, style_id: u32) -> Result<Option<u32>> {
-        let mut rdr = Reader::from_reader(self.styles_xml.as_slice());
-        rdr.config_mut().trim_text(true);
-        let mut in_xfs = false;
-        let mut idx = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => break,
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref() == b"xf" =>
-                {
-                    if idx == style_id {
-                        for a in e.attributes().with_checks(false).flatten() {
-                            if a.key.as_ref() == b"borderId" {
-                                let val: u32 = lexical_core::parse(&a.value)?;
-                                return Ok(Some(val));
-                            }
-                        }
-                        return Ok(None);
-                    }
-                    idx += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        Ok(None)
-    }
-
-    fn xf_alignment(&self, style_id: u32) -> Result<Option<AlignSpec>> {
-        let mut rdr = Reader::from_reader(self.styles_xml.as_slice());
-        rdr.config_mut().trim_text(true);
-        let mut in_xfs = false;
-        let mut xf_idx = 0u32;
-        // let mut depth = 0;
-
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => break,
-
-                Event::Start(ref e) if in_xfs && e.name().as_ref() == b"xf" => {
-                    if xf_idx == style_id {
-                        let mut depth = 1;
-                        while depth > 0 {
-                            match rdr.read_event()? {
-                                Event::Start(ref ie) => {
-                                    depth += 1;
-                                    if ie.name().as_ref() == b"alignment" {
-                                        let mut spec = AlignSpec::default();
-                                        for attr in ie.attributes().with_checks(false).flatten() {
-                                            let val =
-                                                String::from_utf8_lossy(&attr.value).into_owned();
-                                            match attr.key.as_ref() {
-                                                b"horizontal" => spec.horiz = Some(val.parse()?),
-                                                b"vertical" => spec.vert = Some(val.parse()?),
-                                                b"wrapText" => {
-                                                    if val == "1" {
-                                                        spec.wrap = true
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        return Ok(Some(spec));
-                                    }
-                                }
-                                Event::End(_) => depth -= 1,
-                                Event::Eof => break,
-                                _ => {}
-                            }
-                        }
-                        return Ok(None);
-                    }
-                    xf_idx += 1;
-                }
-                Event::Empty(ref _e) if in_xfs => {
-                    if xf_idx == style_id {
-                        return Ok(None);
-                    }
-                    xf_idx += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        Ok(None)
-    }
-
-    fn cell_style_id(&self, coord: &str) -> Result<Option<u32>> {
+    pub(crate) fn cell_style_id(&self, coord: &str) -> Result<Option<u32>> {
         let tag = format!(r#"<c r="{coord}""#);
         if let Some(pos) = memmem::rfind(&self.sheet_xml, tag.as_bytes()) {
             if let Some(spos) = find_bytes_from(&self.sheet_xml, b" s=\"", pos) {

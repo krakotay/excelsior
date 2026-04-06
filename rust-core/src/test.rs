@@ -83,6 +83,57 @@ fn set_number_format() -> Result<()> {
     app.save(file_name_out)?;
     Ok(())
 }
+
+#[test]
+fn style_patch_preserves_number_format() -> Result<()> {
+    let file_name = "../test/numeric_format_test.xlsx";
+    let mut app = XlsxEditor::open(file_name, "Sheet1")?;
+
+    app.set_number_format("A9", "#,##0.00")?;
+    let before_sid = app.cell_style_id("A9")?;
+    let before = app.read_style_parts(before_sid)?;
+    assert_eq!(before.num_fmt_code.as_deref(), Some("#,##0.00"));
+
+    app.set_fill("A9", "FFCCCC")?;
+    let after_sid = app.cell_style_id("A9")?;
+    let after = app.read_style_parts(after_sid)?;
+    assert_eq!(after.num_fmt_code.as_deref(), Some("#,##0.00"));
+    assert!(after.fill.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn column_number_format_preserves_existing_fill() -> Result<()> {
+    let file_name = "../test/style_test.xlsx";
+    let mut app = XlsxEditor::open(file_name, "Sheet1")?;
+
+    app.set_fill("A2", "FFCCCC")?;
+    let before = app.read_style_parts(app.cell_style_id("A2")?)?;
+    assert!(before.fill.is_some());
+
+    app.set_number_format("A:", "#,##0.00")?;
+    let after = app.read_style_parts(app.cell_style_id("A2")?)?;
+    assert!(after.fill.is_some());
+    assert_eq!(after.num_fmt_code.as_deref(), Some("#,##0.00"));
+    Ok(())
+}
+
+#[test]
+fn row_number_format_preserves_existing_fill() -> Result<()> {
+    let file_name = "../test/style_test.xlsx";
+    let mut app = XlsxEditor::open(file_name, "Sheet1")?;
+
+    app.set_fill("B2", "CCE5FF")?;
+    let before = app.read_style_parts(app.cell_style_id("B2")?)?;
+    assert!(before.fill.is_some());
+
+    app.set_number_format("2:", "yyyy-mm-dd")?;
+    let after = app.read_style_parts(app.cell_style_id("B2")?)?;
+    assert!(after.fill.is_some());
+    assert_eq!(after.num_fmt_code.as_deref(), Some("yyyy-mm-dd"));
+    Ok(())
+}
 #[test]
 fn set_style() -> Result<()> {
     let file_name = "../test/style_test.xlsx";
