@@ -13,3 +13,6 @@ license  = "GPL-3.0"
 zip = { version = "7.4.0", default-features = false, features = ["deflate"] }
 anyhow = "1.0.100"
 
+[profile.release]
+lto = true
+codegen-units = 1

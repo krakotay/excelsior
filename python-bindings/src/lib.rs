@@ -1,9 +1,9 @@
-use pyo3::PyRefMut;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDate, PyDateAccess, PyDateTime, PyDict, PyTimeAccess};
+use pyo3::PyRefMut;
 use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
-use rust_core::{XlsxEditor, scan};
+use rust_core::{scan, XlsxEditor};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use zip::write::FileOptions;
@@ -13,6 +13,105 @@ fn py_value_to_excel_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
         return Ok(String::new());
     }
     Ok(value.str()?.to_str()?.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolarsColFormat {
+    Date,
+    DateTime,
+}
+
+const EXCEL_DATE_FORMAT: &str = "yyyy-mm-dd";
+const EXCEL_DATETIME_FORMAT: &str = "yyyy-mm-dd hh:mm:ss";
+
+fn merge_polars_col_format(
+    current: Option<PolarsColFormat>,
+    next: Option<PolarsColFormat>,
+) -> Option<PolarsColFormat> {
+    match (current, next) {
+        (None, x) => x,
+        (x, None) => x,
+        (Some(PolarsColFormat::Date), Some(PolarsColFormat::DateTime)) => {
+            Some(PolarsColFormat::DateTime)
+        }
+        (Some(PolarsColFormat::DateTime), Some(PolarsColFormat::Date)) => {
+            Some(PolarsColFormat::DateTime)
+        }
+        (Some(cur), Some(_)) => Some(cur),
+    }
+}
+
+fn trim_float_for_excel(value: f64) -> String {
+    let mut s = format!("{value:.15}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let y = year as i64 - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn excel_serial_from_date_parts(year: i32, month: u8, day: u8) -> f64 {
+    let days_since_unix_epoch = days_from_civil(year, month, day);
+    days_since_unix_epoch as f64 + 25_569.0
+}
+
+fn excel_serial_from_date(value: &Bound<'_, PyDate>) -> f64 {
+    excel_serial_from_date_parts(value.get_year(), value.get_month(), value.get_day())
+}
+
+fn excel_serial_from_datetime(value: &Bound<'_, PyDateTime>) -> f64 {
+    let day_serial =
+        excel_serial_from_date_parts(value.get_year(), value.get_month(), value.get_day());
+    let seconds = (value.get_hour() as f64) * 3600.0
+        + (value.get_minute() as f64) * 60.0
+        + (value.get_second() as f64)
+        + (value.get_microsecond() as f64) / 1_000_000.0;
+    day_serial + seconds / 86_400.0
+}
+
+fn py_value_to_excel_cell(value: &Bound<'_, PyAny>) -> PyResult<(String, Option<PolarsColFormat>)> {
+    if value.is_none() {
+        return Ok((String::new(), None));
+    }
+
+    if value.is_instance_of::<PyBool>() {
+        let b: bool = value.extract()?;
+        return Ok((
+            if b {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            },
+            None,
+        ));
+    }
+
+    if let Ok(dt) = value.cast::<PyDateTime>() {
+        let serial = excel_serial_from_datetime(&dt);
+        return Ok((
+            trim_float_for_excel(serial),
+            Some(PolarsColFormat::DateTime),
+        ));
+    }
+
+    if let Ok(date) = value.cast::<PyDate>() {
+        let serial = excel_serial_from_date(&date);
+        return Ok((trim_float_for_excel(serial), Some(PolarsColFormat::Date)));
+    }
+
+    Ok((py_value_to_excel_string(value)?, None))
 }
 
 fn index_to_excel_col(mut idx: usize) -> String {
@@ -427,22 +526,58 @@ impl Editor {
             .map_err(|_| PyRuntimeError::new_err("Expected polars.DataFrame with .iter_rows()"))?;
 
         let mut table: Vec<Vec<String>> = Vec::new();
+        let mut col_formats: Vec<Option<PolarsColFormat>> = vec![None; columns.len()];
+        let mut data_row_count: u32 = 0;
         table.push(columns);
 
         for row in rows_iter.try_iter()? {
             let row_any = row?;
             let row_values: Vec<Py<PyAny>> = row_any.extract()?;
             let mut out_row = Vec::with_capacity(row_values.len());
-            for value in row_values {
-                out_row.push(py_value_to_excel_string(value.bind(py).as_any())?);
+            for (idx, value) in row_values.into_iter().enumerate() {
+                let (cell_value, detected_fmt) = py_value_to_excel_cell(value.bind(py).as_any())?;
+                if let Some(slot) = col_formats.get_mut(idx) {
+                    *slot = merge_polars_col_format(*slot, detected_fmt);
+                }
+                out_row.push(cell_value);
             }
             table.push(out_row);
+            data_row_count += 1;
         }
 
         let start = start_cell.as_deref().unwrap_or("A1");
         self.editor
             .append_table_at(start, table)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        if data_row_count > 0 {
+            let row_start_pos = start
+                .find(|c: char| c.is_ascii_digit())
+                .ok_or_else(|| PyRuntimeError::new_err("Invalid start cell for with_polars"))?;
+            let col_letters = &start[..row_start_pos];
+            let start_col_idx = excel_col_to_index(col_letters)?;
+            let start_row: u32 = start[row_start_pos..]
+                .parse()
+                .map_err(|_| PyRuntimeError::new_err("Invalid start row for with_polars"))?;
+
+            let data_row_start = start_row + 1;
+            let data_row_end = start_row + data_row_count;
+
+            for (offset, col_format) in col_formats.into_iter().enumerate() {
+                let Some(col_format) = col_format else {
+                    continue;
+                };
+                let col_name = index_to_excel_col(start_col_idx + offset);
+                let range = format!("{col_name}{data_row_start}:{col_name}{data_row_end}");
+                let fmt = match col_format {
+                    PolarsColFormat::Date => EXCEL_DATE_FORMAT,
+                    PolarsColFormat::DateTime => EXCEL_DATETIME_FORMAT,
+                };
+                self.editor
+                    .set_number_format(&range, fmt)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+        }
         Ok(())
     }
 
