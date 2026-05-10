@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use quick_xml::{Reader, Writer, events::Event};
 
 use crate::{
-    files_part::needs_xml_space_preserve,
+    files_part::{needs_xml_space_preserve, sheet_path_for_name},
     style::{AlignSpec, HorizAlignment, VertAlignment},
 };
 // use tempfile::NamedTempFile;
@@ -100,14 +100,8 @@ impl XlsxEditor {
     /// # Returns
     /// A `Result` containing an `XlsxEditor` instance if successful, or an `anyhow::Error` otherwise.
     pub fn open<P: AsRef<Path>>(src: P, sheet_name: &str) -> Result<Self> {
-        let sheet_names = scan(src.as_ref())?;
-        let sheet_id = sheet_names
-            .iter()
-            .position(|n| n == sheet_name)
-            .context(format!("Sheet '{}' not found", sheet_name))?
-            + 1;
-        println!("Sheet ID: {} with name {}", sheet_id, sheet_name);
-        Self::open_sheet(src, sheet_id)
+        let sheet_path = sheet_path_for_name(src.as_ref(), sheet_name)?;
+        Self::open_sheet_path(src, sheet_path)
     }
 
     /// Appends a single row of cells to the end of the current sheet.
@@ -384,6 +378,8 @@ impl XlsxEditor {
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
     pub fn set_cell<S: ToString>(&mut self, coord: &str, value: S) -> Result<()> {
+        ensure_sheetdata_open_close(&mut self.sheet_xml)?;
+
         // row number
         let row_start = coord
             .find(|c: char| c.is_ascii_digit())

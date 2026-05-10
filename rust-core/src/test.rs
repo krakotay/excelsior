@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::{
+    files_part::normalize_workbook_target,
     XlsxEditor, scan,
     style::{AlignSpec, HorizAlignment, VertAlignment},
 };
@@ -250,6 +251,174 @@ fn add_worksheet() -> Result<()> {
         .append_table_at("A1", [["4", "5", "6"], ["7", "8", "9"]])?;
 
     xl.save(file_name_out)?;
+    Ok(())
+}
+
+#[test]
+fn inserted_sheet_keeps_name_based_open_and_switching() -> Result<()> {
+    let file_name = "../test/edge_cases/generated/inn_filter_cases.xlsx";
+    let tmp = tempfile::NamedTempFile::new()?;
+    let out = tmp.path().with_extension("xlsx");
+    let out2 = tmp.path().with_extension("roundtrip.xlsx");
+
+    let mut xl = XlsxEditor::open(file_name, "дебет")?;
+    xl.add_worksheet_at("Титульник", 0)?
+        .with_worksheet("дебет")?
+        .set_cell("A1", "patched-debit")?;
+    xl.save(&out)?;
+
+    let mut reopened = XlsxEditor::open(&out, "дебет")?;
+    reopened.set_cell("B1", "opened-by-name")?;
+    reopened.save(&out2)?;
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out2)?)?;
+    let mut sheet1 = String::new();
+    let mut sheet2 = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("xl/worksheets/sheet1.xml")?
+            .read_to_string(&mut sheet1)?;
+        zip.by_name("xl/worksheets/sheet2.xml")?
+            .read_to_string(&mut sheet2)?;
+    }
+
+    assert!(sheet1.contains("patched-debit"));
+    assert!(sheet1.contains("opened-by-name"));
+    assert!(!sheet2.contains("patched-debit"));
+    assert!(!sheet2.contains("opened-by-name"));
+    Ok(())
+}
+
+#[test]
+fn absolute_workbook_relationship_targets_are_supported() -> Result<()> {
+    assert_eq!(
+        normalize_workbook_target("/xl/worksheets/sheet1.xml"),
+        "xl/worksheets/sheet1.xml"
+    );
+    assert_eq!(
+        normalize_workbook_target("xl/worksheets/sheet1.xml"),
+        "xl/worksheets/sheet1.xml"
+    );
+    assert_eq!(
+        normalize_workbook_target("worksheets/sheet1.xml"),
+        "xl/worksheets/sheet1.xml"
+    );
+    Ok(())
+}
+
+#[test]
+fn saving_over_source_keeps_valid_zip() -> Result<()> {
+    let file_name = "../test/edge_cases/generated/inn_filter_cases.xlsx";
+    let tmp = tempfile::NamedTempFile::new()?;
+    let path = tmp.path().with_extension("xlsx");
+    std::fs::copy(file_name, &path)?;
+
+    let mut xl = XlsxEditor::open(&path, "дебет")?;
+    xl.set_cell("A1", "same-path-save-ok")?;
+    xl.save(&path)?;
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&path)?)?;
+    let mut sheet1 = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("xl/worksheets/sheet1.xml")?
+            .read_to_string(&mut sheet1)?;
+    }
+
+    assert!(sheet1.contains("same-path-save-ok"));
+    Ok(())
+}
+
+#[test]
+fn style_empty_inserted_sheet_before_cells_keeps_single_xml_root() -> Result<()> {
+    let file_name = "../test/edge_cases/generated/inn_filter_cases.xlsx";
+    let tmp = tempfile::NamedTempFile::new()?;
+    let out = tmp.path().with_extension("xlsx");
+
+    let mut xl = XlsxEditor::open(file_name, "дебет")?;
+    xl.add_worksheet_at("Титульник", 0)?
+        .set_border("B4:D12", "thin")?
+        .set_column_width("A", 5.0)?
+        .set_column_width("B", 15.0)?;
+    xl.set_cell("B4", "РАБОЧИЕ ДОКУМЕНТЫ АУДИТОРА")?;
+    xl.merge_cells("B4:D4")?;
+    xl.save(&out)?;
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out)?)?;
+    let mut title = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("xl/worksheets/sheet3.xml")?
+            .read_to_string(&mut title)?;
+    }
+
+    assert!(title.trim_start().starts_with("<?xml"));
+    assert_eq!(title.matches("<worksheet").count(), 1);
+    assert!(title.contains("<sheetData>"));
+    assert!(title.contains("<row r=\"4\">"));
+    assert!(title.contains("РАБОЧИЕ ДОКУМЕНТЫ АУДИТОРА"));
+    Ok(())
+}
+
+#[test]
+fn column_text_format_then_title_styles_preserve_widths_and_styles() -> Result<()> {
+    let file_name = "../test/edge_cases/generated/inn_filter_cases.xlsx";
+    let tmp = tempfile::NamedTempFile::new()?;
+    let out = tmp.path().with_extension("xlsx");
+
+    let mut xl = XlsxEditor::open(file_name, "дебет")?;
+    xl.add_worksheet("ИНН_аггдебет")?
+        .append_table_at("A1", [["ИНН", "количество"], ["1233555", "1"], ["0000000000", "1"]])?;
+    xl.set_number_format("A:", "@")?;
+    xl.set_number_format("C:", "#,##0.00")?;
+    xl.set_number_format("D:", "#,##0.00")?;
+    xl.add_worksheet_at("Титульник", 0)?
+        .set_border("B4:D12", "thin")?
+        .set_column_width("A", 5.0)?
+        .set_column_width("B", 15.0)?
+        .set_column_width("C", 40.0)?
+        .set_column_width("D", 15.0)?
+        .set_column_width("E", 5.0)?;
+    xl.set_cell("B4", "РАБОЧИЕ ДОКУМЕНТЫ АУДИТОРА")?;
+    xl.set_font_with_alignment(
+        "B4",
+        "Times New Roman",
+        16.0,
+        true,
+        false,
+        &AlignSpec {
+            horiz: Some(HorizAlignment::Center),
+            vert: Some(VertAlignment::Center),
+            wrap: false,
+        },
+    )?;
+    xl.save(&out)?;
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out)?)?;
+    let mut styles = String::new();
+    let mut agg = String::new();
+    let mut title = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("xl/styles.xml")?.read_to_string(&mut styles)?;
+        zip.by_name("xl/worksheets/sheet3.xml")?
+            .read_to_string(&mut agg)?;
+        zip.by_name("xl/worksheets/sheet4.xml")?
+            .read_to_string(&mut title)?;
+    }
+
+    assert!(agg.contains(r#"<col min="1" max="1" width="8.43" customWidth="1" style=""#));
+    assert!(agg.contains(r#"<col min="3" max="4" width="8.43" customWidth="1" style=""#));
+    assert!(agg.contains(r#"<c r="A2" s="1" t="inlineStr"><is><t>1233555</t></is></c>"#));
+    assert!(agg.contains(r#"<c r="A3" s="1" t="inlineStr"><is><t>0000000000</t></is></c>"#));
+    assert!(!agg.contains(r#"<c r="A2" s="1"><v>1233555</v></c>"#));
+    assert!(styles.contains(r#"numFmtId="49""#));
+    assert!(styles.contains(r#"<xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>"#));
+    assert!(!styles.contains(r#"formatCode="@""#));
+    assert!(title.contains(r#"<col min="1" max="1" width="5" customWidth="1""#));
+    assert!(title.contains(r#"<col min="3" max="3" width="40" customWidth="1""#));
+    assert!(!title.contains(r#"width="0""#));
+    assert!(title.contains(r#"<c r="B4" s=""#));
     Ok(())
 }
 

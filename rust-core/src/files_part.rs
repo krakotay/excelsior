@@ -1,5 +1,5 @@
 /// files_part.rs
-use crate::{XlsxEditor, find_bytes_from, scan};
+use crate::{XlsxEditor, find_bytes_from};
 use ::zip as zip_crate;
 use anyhow::{Context, Result, bail};
 use memchr::memmem;
@@ -98,15 +98,60 @@ fn ensure_ct_override_for_sheets(ct_xml: &mut Vec<u8>, sheet_paths: &[String]) {
     }
 }
 
+pub(crate) fn normalize_workbook_target(target: &str) -> String {
+    let target = target.trim_start_matches('/');
+    if target.starts_with("xl/") {
+        target.to_string()
+    } else {
+        format!("xl/{target}")
+    }
+}
+
+pub(crate) fn sheet_path_for_name<P: AsRef<Path>>(src: P, sheet_name: &str) -> Result<String> {
+    let src_path = src.as_ref();
+    let mut zip = zip_crate::ZipArchive::new(File::open(src_path)?)?;
+
+    let workbook_xml = {
+        let mut wb = zip
+            .by_name("xl/workbook.xml")
+            .context("xl/workbook.xml not found")?;
+        let mut buf = Vec::with_capacity(wb.size() as usize);
+        wb.read_to_end(&mut buf)?;
+        buf
+    };
+
+    let rels_xml = {
+        let mut rels = zip
+            .by_name("xl/_rels/workbook.xml.rels")
+            .context("xl/_rels/workbook.xml.rels not found")?;
+        let mut buf = Vec::with_capacity(rels.size() as usize);
+        rels.read_to_end(&mut buf)?;
+        buf
+    };
+
+    let rid = get_sheet_rid_by_name(&workbook_xml, sheet_name)
+        .with_context(|| format!("Sheet `{sheet_name}` not found in workbook.xml"))?;
+    let (_, _, target) = find_relationship_by_id(&rels_xml, &rid)
+        .with_context(|| format!("Relationship `{rid}` not found in workbook.xml.rels"))?;
+    Ok(normalize_workbook_target(&target))
+}
+
 /// Work with files
 impl XlsxEditor {
     /// Открывает книгу и подготавливает лист `sheet_id` (1‑based).
     pub fn open_sheet<P: AsRef<Path>>(src: P, sheet_id: usize) -> Result<Self> {
+        Self::open_sheet_path(src, format!("xl/worksheets/sheet{sheet_id}.xml"))
+    }
+
+    pub(crate) fn open_sheet_path<P: AsRef<Path>, S: Into<String>>(
+        src: P,
+        sheet_path: S,
+    ) -> Result<Self> {
         let src_path = src.as_ref().to_path_buf();
         let mut zip = zip_crate::ZipArchive::new(File::open(&src_path)?)?;
 
         // ── sheet#.xml ───────────────────────────────────────────────
-        let sheet_path = format!("xl/worksheets/sheet{sheet_id}.xml");
+        let sheet_path = sheet_path.into();
 
         // читаем XML листа в отдельном блоке, чтобы `sheet` дропнулся,
         // и эксклюзивный займ `zip` освободился
@@ -199,6 +244,20 @@ impl XlsxEditor {
     }
 
     pub fn save<P: AsRef<Path>>(&mut self, dst: P) -> Result<()> {
+        let dst_path = dst.as_ref();
+        let same_as_source = dst_path.exists()
+            && std::fs::canonicalize(dst_path).ok() == std::fs::canonicalize(&self.src_path).ok();
+        if same_as_source {
+            let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
+            let temp = tempfile::Builder::new()
+                .prefix(".excelsior-save-")
+                .suffix(".xlsx")
+                .tempfile_in(parent)?;
+            self.save(temp.path())?;
+            std::fs::copy(temp.path(), dst_path)?;
+            return Ok(());
+        }
+
         self.flush_current_sheet();
 
         let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
@@ -412,8 +471,8 @@ impl XlsxEditor {
     pub fn add_worksheet_at(&mut self, sheet_name: &str, mut index: usize) -> Result<&mut Self> {
         // -------- 0) валидации / подготовка ----------
         // 0.1) имя уже существует?
-        let sheet_names = scan(&self.src_path)?;
-        if sheet_names.contains(&sheet_name.to_owned()) {
+        let (_, _, sheet_tags) = parse_sheets_inner(&self.workbook_xml)?;
+        if sheet_tags.iter().any(|s| s.name == sheet_name) {
             bail!("Sheet {} already exists", sheet_name);
         }
 
@@ -716,11 +775,7 @@ impl XlsxEditor {
         })?;
 
         // 3) Абсолютный путь внутри архива
-        let new_sheet_path = if target_rel.starts_with("xl/") {
-            target_rel.clone()
-        } else {
-            format!("xl/{}", target_rel)
-        };
+        let new_sheet_path = normalize_workbook_target(&target_rel);
 
         // 4) Берём XML листа: new_files → loaded_files → zip
         let sheet_xml: Vec<u8> = if let Some(content) = self.new_files.get(&new_sheet_path) {
@@ -756,8 +811,8 @@ impl XlsxEditor {
             return Ok(self);
         }
         // запретим коллизию имён
-        let names = scan(&self.src_path)?;
-        if names.iter().any(|n| n == new_name) {
+        let (_, _, current_tags) = parse_sheets_inner(&self.workbook_xml)?;
+        if current_tags.iter().any(|n| n.name == new_name) {
             anyhow::bail!("Sheet `{}` already exists", new_name);
         }
 
@@ -808,11 +863,7 @@ impl XlsxEditor {
         self.rels_xml.splice(rel_start..rel_end, std::iter::empty());
 
         // 3) отметить файл на удаление + вычистить кэши
-        let abs_path = if target.starts_with("xl/") {
-            target.clone()
-        } else {
-            format!("xl/{}", target)
-        };
+        let abs_path = normalize_workbook_target(&target);
         self.removed_files.insert(abs_path.clone());
         self.new_files.remove(&abs_path);
         self.loaded_files.remove(&abs_path);
@@ -846,11 +897,7 @@ impl XlsxEditor {
 
             if let Some(nrid) = next_rid {
                 if let Some((_, _, t)) = find_relationship_by_id(&self.rels_xml, &nrid) {
-                    let p = if t.starts_with("xl/") {
-                        t
-                    } else {
-                        format!("xl/{}", t)
-                    };
+                    let p = normalize_workbook_target(&t);
                     let sheet_xml: Vec<u8> = if let Some(c) = self.new_files.get(&p) {
                         c.clone()
                     } else if let Some(buf) = self.loaded_files.get(&p) {

@@ -6,6 +6,7 @@ use quick_xml::{Reader, events::Event};
 use std::collections::HashMap;
 use std::{fmt, str::FromStr};
 
+use crate::files_part::needs_xml_space_preserve;
 use crate::style::util::{bump_count, col_index, find_bytes_from};
 use crate::{FontKey, StyleIndex, StyleKey, XfParts, XlsxEditor};
 
@@ -202,6 +203,7 @@ impl StyleIndex {
             fills_count: 0,
             borders_count: 0,
         };
+        seed_builtin_num_fmts(&mut ix);
 
         let mut rdr = Reader::from_reader(styles);
         rdr.config_mut().trim_text(true);
@@ -730,7 +732,8 @@ impl XlsxEditor {
             num_fmt_code: Some(fmt.to_string()),
             ..Default::default()
         };
-        match parse_target(range)? {
+        let target = parse_target(range)?;
+        match &target {
             Target::Cell(c) => {
                 let sid = self.cell_style_id(&c)?;
                 let merged = merge_style_parts(self.read_style_parts(sid)?, &patch);
@@ -738,14 +741,17 @@ impl XlsxEditor {
                 self.apply_style_to_cell(&c, style_id)?;
             }
             Target::Rect { c0, r0, c1, r1 } => {
-                self.apply_patch_rect_one_pass(c0, r0, c1, r1, &patch)?;
+                self.apply_patch_rect_one_pass(*c0, *r0, *c1, *r1, &patch)?;
             }
             Target::Col(c0) => {
-                self.apply_patch_col_one_pass(c0, 1, &patch)?;
+                self.apply_patch_col_one_pass(*c0, 1, &patch)?;
                 let default_sid = self.ensure_style_from_parts(&patch)?;
-                self.set_column_properties(c0, None, Some(default_sid))?;
+                self.set_column_properties(*c0, None, Some(default_sid))?;
             }
-            Target::Row(row) => self.apply_patch_row_one_pass(row, &patch)?,
+            Target::Row(row) => self.apply_patch_row_one_pass(*row, &patch)?,
+        }
+        if fmt == "@" {
+            self.convert_target_cells_to_inline_text(&target)?;
         }
         Ok(())
     }
@@ -803,8 +809,10 @@ impl XlsxEditor {
         let find_gt = memmem::Finder::new(b">");
 
         let mut i = 0usize;
+        let mut saw_row = false;
 
         while let Some(off) = find_row.find(&src[i..]) {
+            saw_row = true;
             let row_start = i + off;
             // всё до <row ...> — как есть
             dst.extend_from_slice(&src[i..row_start]);
@@ -997,9 +1005,10 @@ impl XlsxEditor {
             next_row_needed = cur_row + 1;
         }
 
+        let mut tail_rows = Vec::new();
         while next_row_needed <= range_row_end {
             self.append_full_row_for_range(
-                &mut dst,
+                &mut tail_rows,
                 next_row_needed,
                 range_col_start,
                 range_col_end,
@@ -1010,7 +1019,16 @@ impl XlsxEditor {
         }
 
         // хвост документа
-        dst.extend_from_slice(&src[i..]);
+        if saw_row {
+            dst.extend_from_slice(&tail_rows);
+            dst.extend_from_slice(&src[i..]);
+        } else {
+            let sheet_data_end = memmem::rfind(&src, b"</sheetData>")
+                .context("</sheetData> tag not found")?;
+            dst.extend_from_slice(&src[..sheet_data_end]);
+            dst.extend_from_slice(&tail_rows);
+            dst.extend_from_slice(&src[sheet_data_end..]);
+        }
         self.sheet_xml = dst;
         Ok(())
     }
@@ -1234,6 +1252,90 @@ impl XlsxEditor {
         self.sheet_xml = dst;
         Ok(())
     }
+
+    fn convert_target_cells_to_inline_text(&mut self, target: &Target) -> Result<()> {
+        let src = std::mem::take(&mut self.sheet_xml);
+        let mut dst = Vec::with_capacity(src.len());
+
+        let finder = memmem::Finder::new(b"<c");
+        let mut i = 0usize;
+
+        while let Some(off) = finder.find(&src[i..]) {
+            let cpos = i + off;
+            dst.extend_from_slice(&src[i..cpos]);
+
+            let next = *src.get(cpos + 2).unwrap_or(&b'>');
+            let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
+            let Some(tag_end) = find_bytes_from(&src, b">", cpos) else {
+                dst.extend_from_slice(&src[cpos..]);
+                self.sheet_xml = dst;
+                return Ok(());
+            };
+
+            if !is_cell {
+                dst.extend_from_slice(&src[cpos..=tag_end]);
+                i = tag_end + 1;
+                continue;
+            }
+
+            let self_closing = tag_end > cpos && src[tag_end - 1] == b'/';
+            if self_closing {
+                dst.extend_from_slice(&src[cpos..=tag_end]);
+                i = tag_end + 1;
+                continue;
+            }
+
+            let cell_end = find_bytes_from(&src, b"</c>", tag_end + 1)
+                .context("</c> missing while converting text format")?
+                + "</c>".len();
+            let cell = &src[cpos..cell_end];
+            let tag = &src[cpos..=tag_end];
+
+            if !cell_target_matches(tag, target) || !cell_type_is_numeric_or_default(tag) {
+                dst.extend_from_slice(cell);
+                i = cell_end;
+                continue;
+            }
+            if memmem::find(cell, b"<f").is_some() || memmem::find(cell, b"<is").is_some() {
+                dst.extend_from_slice(cell);
+                i = cell_end;
+                continue;
+            }
+
+            let Some(v_start_rel) = memmem::find(cell, b"<v>") else {
+                dst.extend_from_slice(cell);
+                i = cell_end;
+                continue;
+            };
+            let value_start = v_start_rel + "<v>".len();
+            let Some(v_end_rel) = memmem::find(&cell[value_start..], b"</v>") else {
+                dst.extend_from_slice(cell);
+                i = cell_end;
+                continue;
+            };
+            let value_end = value_start + v_end_rel;
+            let value = std::str::from_utf8(&cell[value_start..value_end])
+                .context("cell value is not UTF-8")?;
+
+            let mut new_tag = remove_attr_from_tag(tag, b"t");
+            insert_attr_before_tag_end(&mut new_tag, r#" t="inlineStr""#);
+            dst.extend_from_slice(&new_tag);
+            dst.extend_from_slice(b"<is>");
+            if needs_xml_space_preserve(value) {
+                dst.extend_from_slice(b"<t xml:space=\"preserve\">");
+            } else {
+                dst.extend_from_slice(b"<t>");
+            }
+            dst.extend_from_slice(xml_text_escape(value).as_bytes());
+            dst.extend_from_slice(b"</t></is></c>");
+
+            i = cell_end;
+        }
+
+        dst.extend_from_slice(&src[i..]);
+        self.sheet_xml = dst;
+        Ok(())
+    }
 }
 
 impl XlsxEditor {
@@ -1363,35 +1465,32 @@ impl XlsxEditor {
         border_id: Option<u32>,
         align: Option<&AlignSpec>,
     ) -> Result<u32> {
-        let mut xf = String::from("<xf xfId=\"0\" ");
+        let mut xf = format!(
+            r#"<xf numFmtId="{fmt_id}" fontId="{}" fillId="{}" borderId="{}" xfId="0""#,
+            font_id.unwrap_or(0),
+            fill_id.unwrap_or(0),
+            border_id.unwrap_or(0)
+        );
 
-        if let Some(fid) = font_id {
-            xf.push_str(&format!(r#"fontId="{fid}" applyFont="1" "#));
+        if fmt_id != 0 {
+            xf.push_str(r#" applyNumberFormat="1""#);
         }
-        if let Some(fid) = fill_id {
-            xf.push_str(&format!(r#"fillId="{fid}" applyFill="1" "#));
+        if font_id.is_some() {
+            xf.push_str(r#" applyFont="1""#);
         }
-        if let Some(bid) = border_id {
-            xf.push_str(&format!(r#"borderId="{bid}" applyBorder="1" "#));
+        if fill_id.is_some() {
+            xf.push_str(r#" applyFill="1""#);
         }
-
-        xf.push_str(&format!(
-            r#"numFmtId="{}"{} "#,
-            fmt_id,
-            if fmt_id != 0 {
-                r#" applyNumberFormat="1""#
-            } else {
-                ""
-            }
-        ));
+        if border_id.is_some() {
+            xf.push_str(r#" applyBorder="1""#);
+        }
         if align.is_some() {
-            xf.push_str(r#"applyAlignment="1" "#);
+            xf.push_str(r#" applyAlignment="1""#);
         }
-        xf.pop();
-        xf.push('>');
 
         if let Some(al) = align {
             if al.horiz.is_some() || al.vert.is_some() || al.wrap {
+                xf.push('>');
                 xf.push_str("<alignment");
                 if let Some(h) = &al.horiz {
                     xf.push_str(&format!(r#" horizontal="{}""#, h));
@@ -1403,9 +1502,13 @@ impl XlsxEditor {
                     xf.push_str(r#" wrapText="1""#);
                 }
                 xf.push_str("/>");
+                xf.push_str("</xf>");
+            } else {
+                xf.push_str("/>");
             }
+        } else {
+            xf.push_str("/>");
         }
-        xf.push_str("</xf>");
 
         let pos = memmem::rfind(&self.styles_xml, b"</cellXfs>")
             .context("styles.xml: </cellXfs> not found")?;
@@ -1481,10 +1584,119 @@ fn merge_style_parts(mut base: StyleParts, patch: &StyleParts) -> StyleParts {
     base
 }
 
+fn builtin_num_fmt_id(code: &str) -> Option<u32> {
+    match code {
+        "General" => Some(0),
+        "0" => Some(1),
+        "0.00" => Some(2),
+        "#,##0" => Some(3),
+        "#,##0.00" => Some(4),
+        "0%" => Some(9),
+        "0.00%" => Some(10),
+        "0.00E+00" => Some(11),
+        "@" => Some(49),
+        _ => None,
+    }
+}
+
+fn seed_builtin_num_fmts(ix: &mut StyleIndex) {
+    for (code, id) in [
+        ("General", 0),
+        ("0", 1),
+        ("0.00", 2),
+        ("#,##0", 3),
+        ("#,##0.00", 4),
+        ("0%", 9),
+        ("0.00%", 10),
+        ("0.00E+00", 11),
+        ("@", 49),
+    ] {
+        ix.numfmt_by_code.entry(code.to_string()).or_insert(id);
+        ix.numfmt_code_by_id.entry(id).or_insert_with(|| code.to_string());
+    }
+}
+
+fn cell_target_matches(cell_tag: &[u8], target: &Target) -> bool {
+    let Some(coord) = cell_coord(cell_tag) else {
+        return false;
+    };
+    let (col, row) = split_coord(&coord);
+    match target {
+        Target::Cell(c) => c.eq_ignore_ascii_case(&coord),
+        Target::Rect { c0, r0, c1, r1 } => {
+            let min_c = (*c0).min(*c1);
+            let max_c = (*c0).max(*c1);
+            let min_r = (*r0).min(*r1);
+            let max_r = (*r0).max(*r1);
+            col >= min_c && col <= max_c && row >= min_r && row <= max_r
+        }
+        Target::Col(c) => col == *c,
+        Target::Row(r) => row == *r,
+    }
+}
+
+fn cell_coord(cell_tag: &[u8]) -> Option<String> {
+    let rpos = find_bytes_from(cell_tag, b" r=\"", 0)?;
+    let start = rpos + 4;
+    let end = find_bytes_from(cell_tag, b"\"", start)?;
+    Some(String::from_utf8_lossy(&cell_tag[start..end]).into_owned())
+}
+
+fn cell_type_is_numeric_or_default(cell_tag: &[u8]) -> bool {
+    let Some(tpos) = find_bytes_from(cell_tag, b" t=\"", 0) else {
+        return true;
+    };
+    let start = tpos + 4;
+    let Some(end) = find_bytes_from(cell_tag, b"\"", start) else {
+        return false;
+    };
+    &cell_tag[start..end] == b"n"
+}
+
+fn remove_attr_from_tag(tag: &[u8], attr: &[u8]) -> Vec<u8> {
+    let mut out = tag.to_vec();
+    let mut needle = Vec::with_capacity(attr.len() + 3);
+    needle.extend_from_slice(b" ");
+    needle.extend_from_slice(attr);
+    needle.extend_from_slice(b"=\"");
+
+    while let Some(pos) = memmem::find(&out, &needle) {
+        let value_start = pos + needle.len();
+        let Some(value_end) = find_bytes_from(&out, b"\"", value_start) else {
+            break;
+        };
+        out.drain(pos..value_end + 1);
+    }
+    out
+}
+
+fn insert_attr_before_tag_end(tag: &mut Vec<u8>, attr: &str) {
+    let insert_at = if tag.len() >= 2 && tag[tag.len() - 2] == b'/' {
+        tag.len() - 2
+    } else {
+        tag.len() - 1
+    };
+    tag.splice(insert_at..insert_at, attr.bytes());
+}
+
+fn xml_text_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /* ========================== LOW-LEVEL HELPERS ============================= */
 
 impl XlsxEditor {
     fn ensure_num_fmt(&mut self, code: &str) -> Result<u32> {
+        if let Some(id) = builtin_num_fmt_id(code) {
+            let ix = self.style_ix_mut()?;
+            ix.numfmt_by_code.entry(code.to_string()).or_insert(id);
+            ix.numfmt_code_by_id.entry(id).or_insert_with(|| code.to_string());
+            return Ok(id);
+        }
+
         // A) есть в кеше?
         if let Some(id) = self
             .styles_index

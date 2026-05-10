@@ -6,6 +6,8 @@ use quick_xml::{events::Event, Reader};
 use crate::XlsxEditor;
 use crate::style::util::find_bytes_from;
 
+const DEFAULT_COLUMN_WIDTH: f64 = 8.43;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ColProp {
     width: Option<f64>,
@@ -43,6 +45,10 @@ impl XlsxEditor {
         }
         if let Some(s) = style_id {
             prop.style = Some(s);
+            if prop.width.is_none() {
+                prop.width = Some(DEFAULT_COLUMN_WIDTH);
+                prop.custom_width = true;
+            }
         }
 
         self.write_cols_map(cols_start, cols_end, &cols_map)
@@ -52,10 +58,9 @@ impl XlsxEditor {
         use memchr::memmem;
 
         // уже есть?
-        if let (Some(start), Some(end)) = (
-            memmem::find(&self.sheet_xml, b"<cols>"),
-            memmem::find(&self.sheet_xml, b"</cols>"),
-        ) {
+        if let Some(start) = memmem::find(&self.sheet_xml, b"<cols") {
+            let end = find_bytes_from(&self.sheet_xml, b"</cols>", start)
+                .context("</cols> not found")?;
             return Ok((start, end + "</cols>".len()));
         }
 
@@ -175,9 +180,10 @@ impl XlsxEditor {
 
 fn build_one_col_tag(min: u32, max: u32, p: &ColProp) -> String {
     let mut s = format!(r#"<col min="{min}" max="{max}""#);
-    if let Some(w) = p.width {
+    let width = p.width.or_else(|| p.style.map(|_| DEFAULT_COLUMN_WIDTH));
+    if let Some(w) = width {
         s.push_str(&format!(r#" width="{w}""#));
-        if p.custom_width {
+        if p.custom_width || p.style.is_some() {
             s.push_str(r#" customWidth="1""#);
         }
     }
