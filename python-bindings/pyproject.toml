@@ -32,6 +32,7 @@ dependencies = [
 bindings = "pyo3"
 module-name = "excelsior"
 include = [
+    { path = "README.md", format = "sdist" },
     "excelsior/__init__.pyi",
     "excelsior/excelsior.pyi",
     "excelsior/py.typed", # опционально
