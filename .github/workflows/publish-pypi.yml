@@ -11,10 +11,15 @@ on:
         description: 'Release version (e.g. 0.10.0)'
         required: true
   push:
+    branches: ["**"]
     tags: ["v*.*.*"]
 
 jobs:
   build:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      startsWith(github.event.head_commit.message, 'fix')
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -87,7 +92,13 @@ jobs:
 
   release:
     needs: build
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      startsWith(github.event.head_commit.message, 'fix')
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version)) || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('fix-{0}', github.sha) }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -109,8 +120,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ inputs.version || github.ref_name }}
-          name: Release v${{ inputs.version || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Release ${{ env.RELEASE_TAG }}
           files: release-dist/*
 
       - name: Publish to PyPI (Trusted Publisher)
