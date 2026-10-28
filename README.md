@@ -77,6 +77,24 @@ editor.save("output.xlsx")
 The Rust crate also exports `rust_core::create_excel(path, sheet_name)` and
 `XlsxEditor::create(path, sheet_name)`. See [docs/usage.md](docs/usage.md) for more.
 
+## Local development
+
+Install `just` and `uv`, then run from the repository root:
+
+```sh
+just build
+just dev
+just test
+```
+
+`uv` creates/uses `python-bindings/.venv` and installs maturin automatically.
+No environment activation or PowerShell is required. These same recipes are
+available from `python-bindings/`. Pass extra maturin options as one quoted
+argument, for example `just build "--interpreter python3.15"`. To choose the
+Python used for local development, set `UV_PYTHON`, for example
+`UV_PYTHON=3.14 just dev` in a POSIX shell. Benchmark recipes in
+`python-bindings/justfile` additionally require `hyperfine` on PATH.
+
 ## Build and release
 
 GitHub Actions builds and tests wheels for Python 3.10–3.15 on Linux,

@@ -12,3 +12,4 @@
 - Include typing markers/stubs and expose the loaded package version.
 - Run Python tests without a required LibreOffice installation, and publish
   only on manual release requests or version tags.
+- Make both justfiles portable through uv-managed environments without shell activation.

@@ -1,15 +1,30 @@
+[windows]
+set shell := ["cmd.exe", "/c"]
+
+# Delegate build/test commands so both entry points share the same settings.
+build args="":
+    just --justfile ../justfile build "{{args}}"
+
+dev args="":
+    just --justfile ../justfile dev "{{args}}"
+
+test args="":
+    just --justfile ../justfile test "{{args}}"
+
 speed-all v="":
-	cd speed_tests && hyperfine "python excelsior_speed.py" "python openpyxl_speed.py" --export-markdown speed-test-{{v}}.md -M 3
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python excelsior_speed.py" "python openpyxl_speed.py" --export-markdown speed-test-{{v}}.md -M 3
+
 speed-rust:
-	cd speed_tests && hyperfine "python excelsior_speed.py" --export-markdown speed-excelsior.md -m 10
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python excelsior_speed.py" --export-markdown speed-excelsior.md -m 10
 
 speed-style v="":
-	cd speed_tests && hyperfine "python excelsior_speed_style.py"  --export-markdown speed-test-style-{{v}}.md -M 3
-
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python excelsior_speed_style.py" --export-markdown speed-test-style-{{v}}.md -M 3
 
 speed-polars-excelsior v="":
-	cd speed_tests && hyperfine "python excelsior_speed_polars.py"  --export-markdown speed-test-polars-excelsior-{{v}}.md -M 3
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python excelsior_speed_polars.py" --export-markdown speed-test-polars-excelsior-{{v}}.md -M 3
+
 speed-polars-openpyxl v="":
-	cd speed_tests && hyperfine "python openpyxl_speed_polars.py"  --export-markdown speed-test-polars-openpyxl-{{v}}.md -M 3
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python openpyxl_speed_polars.py" --export-markdown speed-test-polars-openpyxl-{{v}}.md -M 3
+
 speed-polars-openpyxl-excelsior v="":
-	cd speed_tests && hyperfine "python openpyxl_speed_polars.py" "python excelsior_speed_polars.py"  --export-markdown speed-test-polars-openpyxl-excelsior-{{v}}.md -M 3
+    uv --directory speed_tests run --project .. --group benchmark hyperfine "python openpyxl_speed_polars.py" "python excelsior_speed_polars.py" --export-markdown speed-test-polars-openpyxl-excelsior-{{v}}.md -M 3

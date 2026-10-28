@@ -30,6 +30,10 @@ dependencies = []
 polars = ["polars>=1.35"]
 test = ["openpyxl>=3.1.5", "pytest>=9", "polars>=1.35"]
 
+[dependency-groups]
+dev = ["maturin>=1.13,<2"]
+benchmark = ["openpyxl>=3.1.5", "polars>=1.35", "pandas>=2.2", "pyarrow>=20"]
+
 [tool.maturin]
 bindings = "pyo3"
 module-name = "excelsior.excelsior"
