@@ -23,33 +23,26 @@ pub(crate) fn needs_xml_space_preserve(s: &str) -> bool {
 
 // A1 … A1:Z99
 fn update_dimension_bytes(xml: &mut Vec<u8>) {
-    // 1) вычисляем максимум по <c r="..">
+    // Attribute order varies between writers and style patches.
     let (mut max_c, mut max_r) = (0u32, 0u32);
-    let f = memmem::Finder::new(b"<c r=\"");
-    let mut i = 0usize;
-    while let Some(off) = f.find(&xml[i..]) {
-        let start = i + off;
-        let v0 = start + 6;
-        let Some(v1) = super::find_bytes_from(xml, b"\"", v0) else {
+    let mut i = 0;
+    while let Some(offset) = memmem::find(&xml[i..], b"<c ") {
+        let begin = i + offset;
+        let Some(end) = find_bytes_from(xml, b">", begin) else {
             break;
         };
-        let coord = &xml[v0..v1];
-        if let Some(p) = coord.iter().position(|b| b.is_ascii_digit()) {
-            let mut cidx: u32 = 0;
-            for &b in &coord[..p] {
-                let u = (b as char).to_ascii_uppercase() as u8;
-                cidx = cidx * 26 + ((u - b'A') as u32 + 1);
-            }
-            if cidx > 0 {
-                max_c = max_c.max(cidx - 1);
-            }
-            if let Ok(rs) = std::str::from_utf8(&coord[p..]) {
-                if let Ok(rn) = rs.parse::<u32>() {
-                    max_r = max_r.max(rn);
+        if let Some(offset) = memmem::find(&xml[begin..end], b" r=\"") {
+            let start = begin + offset + 4;
+            if let Some(stop) = find_bytes_from(xml, b"\"", start) {
+                if let Ok(coord) = std::str::from_utf8(&xml[start..stop]) {
+                    if let Ok((col, row)) = crate::data::parse_coord(coord) {
+                        max_c = max_c.max(col as u32);
+                        max_r = max_r.max(row);
+                    }
                 }
             }
         }
-        i = v1 + 1;
+        i = end + 1;
     }
 
     // 2) собрать новый <dimension .../>
@@ -147,7 +140,7 @@ impl XlsxEditor {
         src: P,
         sheet_path: S,
     ) -> Result<Self> {
-        let src_path = src.as_ref().to_path_buf();
+        let src_path = std::fs::canonicalize(src.as_ref())?;
         let mut zip = zip_crate::ZipArchive::new(File::open(&src_path)?)?;
 
         // ── sheet#.xml ───────────────────────────────────────────────
@@ -202,12 +195,13 @@ impl XlsxEditor {
         let mut last_row = 0;
         while let Ok(ev) = reader.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"row" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"row" =>
+                {
                     if let Some(r) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                        (a.key.as_ref() == b"r")
-                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                        (a.key.as_ref().as_bytes() == b"r").then(|| a.value.clone().into_owned())
                     }) {
-                        last_row = r.parse::<u32>().unwrap_or(last_row);
+                        last_row = last_row.max(r.parse::<u32>().unwrap_or(last_row));
                     }
                 }
                 Event::Eof => break,
@@ -233,31 +227,34 @@ impl XlsxEditor {
     fn flush_current_sheet(&mut self) {
         self.new_files
             .insert(self.sheet_path.clone(), self.sheet_xml.clone());
+    }
 
-        // let cur_path = self.sheet_path.clone();
-        // let cur_xml = self.sheet_xml.clone();
-        // if let Some((_, c)) = self.new_files.iter_mut().find(|(p, _)| p == &cur_path) {
-        //     *c = cur_xml;
-        // } else {
-        //     self.new_files.push((cur_path, cur_xml));
-        // }
+    /// Save to the workbook's original path, independent of later cwd changes.
+    pub fn save_in_place(&mut self) -> Result<()> {
+        let path = self.src_path.clone();
+        self.save(path)
     }
 
     pub fn save<P: AsRef<Path>>(&mut self, dst: P) -> Result<()> {
         let dst_path = dst.as_ref();
-        let same_as_source = dst_path.exists()
-            && std::fs::canonicalize(dst_path).ok() == std::fs::canonicalize(&self.src_path).ok();
-        if same_as_source {
-            let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
-            let temp = tempfile::Builder::new()
-                .prefix(".excelsior-save-")
-                .suffix(".xlsx")
-                .tempfile_in(parent)?;
-            self.save(temp.path())?;
-            std::fs::copy(temp.path(), dst_path)?;
-            return Ok(());
+        let parent = dst_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp = tempfile::Builder::new()
+            .prefix(".excelsior-save-")
+            .suffix(".xlsx")
+            .tempfile_in(parent)?;
+        self.write_archive(temp.path())?;
+        if let Ok(metadata) = std::fs::metadata(dst_path) {
+            temp.as_file().set_permissions(metadata.permissions())?;
         }
+        temp.as_file().sync_all()?;
+        temp.persist(dst_path).map_err(|e| e.error)?;
+        Ok(())
+    }
 
+    fn write_archive<P: AsRef<Path>>(&mut self, dst: P) -> Result<()> {
         self.flush_current_sheet();
 
         let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
@@ -435,7 +432,9 @@ impl XlsxEditor {
         let mut n = 0usize;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"sheet" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"sheet" =>
+                {
                     n += 1;
                 }
                 Event::Eof => break,
@@ -495,10 +494,10 @@ impl XlsxEditor {
         rdr.config_mut().trim_text(true);
         while let Ok(ev) = rdr.read_event() {
             if let Event::Empty(ref e) | Event::Start(ref e) = ev {
-                if e.name().as_ref() == b"sheet" {
+                if e.name().as_ref().as_bytes() == b"sheet" {
                     if let Some(id) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                        (a.key.as_ref() == b"sheetId")
-                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                        (a.key.as_ref().as_bytes() == b"sheetId")
+                            .then(|| a.value.clone().into_owned())
                     }) {
                         max_sheet_id = max_sheet_id.max(id.parse::<u32>().unwrap_or(0));
                     }
@@ -516,10 +515,9 @@ impl XlsxEditor {
         rdr.config_mut().trim_text(true);
         while let Ok(ev) = rdr.read_event() {
             if let Event::Empty(ref e) | Event::Start(ref e) = ev {
-                if e.name().as_ref() == b"Relationship" {
+                if e.name().as_ref().as_bytes() == b"Relationship" {
                     if let Some(id) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                        (a.key.as_ref() == b"Id")
-                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                        (a.key.as_ref().as_bytes() == b"Id").then(|| a.value.clone().into_owned())
                     }) {
                         if let Some(num) = id.strip_prefix("rId") {
                             max_rid = max_rid.max(num.parse::<u32>().unwrap_or(0));
@@ -575,13 +573,17 @@ impl XlsxEditor {
 
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"sheet" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"sheet" =>
+                {
                     let mut name = None;
                     let mut rid = None;
                     // Target пути тут нет — он в rels, так что просто пустим.
                     for a in e.attributes().with_checks(false).flatten() {
-                        let k = a.key.as_ref();
-                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
+                        let k = a.key.as_ref().as_bytes();
+                        let v = a
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                            .into_owned();
                         if k == b"name" {
                             name = Some(v.clone());
                         }
@@ -685,15 +687,6 @@ impl XlsxEditor {
 
 impl XlsxEditor {
     pub fn with_worksheet(&mut self, sheet_name: &str) -> Result<&mut Self> {
-        // 0) Сохраняем текущий лист в new_files без лишних clone
-        {
-            let cur_path = std::mem::take(&mut self.sheet_path);
-            let cur_xml = std::mem::take(&mut self.sheet_xml);
-            if !cur_path.is_empty() {
-                self.new_files.insert(cur_path, cur_xml);
-            }
-        }
-
         // 1) Найти r:id по имени листа в workbook.xml
         let mut rdr = Reader::from_reader(self.workbook_xml.as_slice());
         rdr.config_mut().trim_text(true);
@@ -701,13 +694,17 @@ impl XlsxEditor {
         let mut target_rid: Option<String> = None;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"sheet" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"sheet" =>
+                {
                     let mut name: Option<String> = None;
                     let mut rid: Option<String> = None;
 
                     for a in e.attributes().with_checks(false).flatten() {
-                        let k = a.key.as_ref();
-                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
+                        let k = a.key.as_ref().as_bytes();
+                        let v = a
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                            .into_owned();
                         if k == b"name" {
                             name = Some(v.clone());
                         }
@@ -739,14 +736,16 @@ impl XlsxEditor {
         while let Ok(ev) = rdr.read_event() {
             match ev {
                 Event::Empty(ref e) | Event::Start(ref e)
-                    if e.name().as_ref() == b"Relationship" =>
+                    if e.name().as_ref().as_bytes() == b"Relationship" =>
                 {
                     let mut id: Option<String> = None;
                     let mut target: Option<String> = None;
 
                     for a in e.attributes().with_checks(false).flatten() {
-                        let k = a.key.as_ref();
-                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
+                        let k = a.key.as_ref().as_bytes();
+                        let v = a
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                            .into_owned();
                         if k == b"Id" {
                             id = Some(v.clone());
                         }
@@ -778,7 +777,9 @@ impl XlsxEditor {
         let new_sheet_path = normalize_workbook_target(&target_rel);
 
         // 4) Берём XML листа: new_files → loaded_files → zip
-        let sheet_xml: Vec<u8> = if let Some(content) = self.new_files.get(&new_sheet_path) {
+        let sheet_xml: Vec<u8> = if new_sheet_path == self.sheet_path {
+            self.sheet_xml.clone()
+        } else if let Some(content) = self.new_files.get(&new_sheet_path) {
             content.clone()
         } else if let Some(buf) = self.loaded_files.get(&new_sheet_path) {
             buf.clone()
@@ -797,6 +798,9 @@ impl XlsxEditor {
         // 5) Пересчитываем last_row и переключаемся
         let last_row = calc_last_row(&sheet_xml);
 
+        let old_path = std::mem::replace(&mut self.sheet_path, new_sheet_path.clone());
+        let old_xml = std::mem::take(&mut self.sheet_xml);
+        self.new_files.insert(old_path, old_xml);
         self.sheet_path = new_sheet_path;
         self.sheet_xml = sheet_xml;
         self.last_row = last_row;
@@ -878,10 +882,10 @@ impl XlsxEditor {
                 if let quick_xml::events::Event::Empty(ref e)
                 | quick_xml::events::Event::Start(ref e) = ev
                 {
-                    if e.name().as_ref() == b"sheet" {
+                    if e.name().as_ref().as_bytes() == b"sheet" {
                         for a in e.attributes().with_checks(false).flatten() {
-                            if a.key.as_ref() == b"r:id" {
-                                next_rid = Some(String::from_utf8_lossy(&a.value).into_owned());
+                            if a.key.as_ref().as_bytes() == b"r:id" {
+                                next_rid = Some(a.value.clone().into_owned());
                                 break;
                             }
                         }
@@ -937,11 +941,11 @@ fn calc_last_row(sheet_xml: &[u8]) -> u32 {
     let mut last_row = 0u32;
     while let Ok(ev) = rdr.read_event() {
         match ev {
-            Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"row" => {
+            Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref().as_bytes() == b"row" => {
                 if let Some(r) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                    (a.key.as_ref() == b"r").then(|| String::from_utf8_lossy(&a.value).into_owned())
+                    (a.key.as_ref().as_bytes() == b"r").then(|| a.value.clone().into_owned())
                 }) {
-                    last_row = r.parse::<u32>().unwrap_or(last_row);
+                    last_row = last_row.max(r.parse::<u32>().unwrap_or(last_row));
                 }
             }
             Event::Eof => break,
@@ -984,7 +988,6 @@ fn normalize_styles_root(xml: &mut Vec<u8>) {
     }
 }
 
-
 // вытащить r:id листа по его имени
 fn get_sheet_rid_by_name(wb_xml: &[u8], target_name: &str) -> Option<String> {
     let (s_start, s_end) = XlsxEditor::find_sheets_section(wb_xml).ok()?;
@@ -993,12 +996,15 @@ fn get_sheet_rid_by_name(wb_xml: &[u8], target_name: &str) -> Option<String> {
     rdr.config_mut().trim_text(true);
     while let Ok(ev) = rdr.read_event() {
         if let Event::Empty(ref e) | Event::Start(ref e) = ev {
-            if e.name().as_ref() == b"sheet" {
+            if e.name().as_ref().as_bytes() == b"sheet" {
                 let mut name = None;
                 let mut rid = None;
                 for a in e.attributes().with_checks(false).flatten() {
-                    let k = a.key.as_ref();
-                    let v = a.decode_and_unescape_value(rdr.decoder()).ok()?.into_owned();
+                    let k = a.key.as_ref().as_bytes();
+                    let v = a
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .ok()?
+                        .into_owned();
                     if k == b"name" {
                         name = Some(v.clone());
                     }
@@ -1076,14 +1082,16 @@ fn parse_sheets_inner(wb_xml: &[u8]) -> anyhow::Result<(usize, usize, Vec<SheetT
     while let Ok(ev) = rdr.read_event() {
         match ev {
             quick_xml::events::Event::Empty(ref e) | quick_xml::events::Event::Start(ref e)
-                if e.name().as_ref() == b"sheet" =>
+                if e.name().as_ref().as_bytes() == b"sheet" =>
             {
                 let mut name = None;
                 let mut rid = None;
                 let mut sid = None;
                 for a in e.attributes().with_checks(false).flatten() {
-                    let k = a.key.as_ref();
-                    let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
+                    let k = a.key.as_ref().as_bytes();
+                    let v = a
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                        .into_owned();
                     if k == b"name" {
                         name = Some(v.clone());
                     } else if k == b"r:id" {

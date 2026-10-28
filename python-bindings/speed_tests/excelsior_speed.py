@@ -12,6 +12,6 @@ data = generate_table(5, 200)
 last_col = max(editor.last_rows_index("A:E")) + 1
 for row in data:
     editor.append_row(row)
-editor.set_alignment(f'A{last_col}:E{last_col + 200}', AlignSpec(HorizAlignment.Center))    
+editor = editor.set_alignment(f'A{last_col}:E{last_col + 200}', AlignSpec(HorizAlignment.Center))
 
 editor.save(os.path.join(base_dir, "100mb_excelsior.xlsx"))

@@ -1,7 +1,8 @@
 #[cfg(test)]
 use crate::{
+    XlsxEditor,
     files_part::normalize_workbook_target,
-    XlsxEditor, scan,
+    scan,
     style::{AlignSpec, HorizAlignment, VertAlignment},
 };
 #[cfg(test)]
@@ -367,8 +368,10 @@ fn column_text_format_then_title_styles_preserve_widths_and_styles() -> Result<(
     let out = tmp.path().with_extension("xlsx");
 
     let mut xl = XlsxEditor::open(file_name, "дебет")?;
-    xl.add_worksheet("ИНН_аггдебет")?
-        .append_table_at("A1", [["ИНН", "количество"], ["1233555", "1"], ["0000000000", "1"]])?;
+    xl.add_worksheet("ИНН_аггдебет")?.append_table_at(
+        "A1",
+        [["ИНН", "количество"], ["1233555", "1"], ["0000000000", "1"]],
+    )?;
     xl.set_number_format("A:", "@")?;
     xl.set_number_format("C:", "#,##0.00")?;
     xl.set_number_format("D:", "#,##0.00")?;
@@ -413,7 +416,9 @@ fn column_text_format_then_title_styles_preserve_widths_and_styles() -> Result<(
     assert!(agg.contains(r#"<c r="A3" s="1" t="inlineStr"><is><t>0000000000</t></is></c>"#));
     assert!(!agg.contains(r#"<c r="A2" s="1"><v>1233555</v></c>"#));
     assert!(styles.contains(r#"numFmtId="49""#));
-    assert!(styles.contains(r#"<xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>"#));
+    assert!(styles.contains(
+        r#"<xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>"#
+    ));
     assert!(!styles.contains(r#"formatCode="@""#));
     assert!(title.contains(r#"<col min="1" max="1" width="5" customWidth="1""#));
     assert!(title.contains(r#"<col min="3" max="3" width="40" customWidth="1""#));
@@ -437,5 +442,35 @@ fn rename_del_worksheet() -> Result<()> {
     assert!(new_sheets.contains(&"renamed".to_owned()));
     assert!(!new_sheets.contains(&"for_delete".to_owned()));
 
+    Ok(())
+}
+
+#[test]
+fn failed_typed_iterator_preserves_unsaved_worksheet() -> Result<()> {
+    use crate::data::CellValue;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.xlsx");
+    let mut editor = XlsxEditor::create(&path, "Data")?;
+    editor.set_cell("A1", "original")?;
+    let rows = [
+        Ok(vec![CellValue::Number("1".into())]),
+        Err(anyhow::anyhow!("row failed")),
+    ];
+    assert!(editor.write_typed_table_at("A1", rows).is_err());
+    assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("original"));
+    assert_eq!(editor.last_row, 1);
+    Ok(())
+}
+
+#[test]
+fn failed_sheet_selection_preserves_native_editor() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.xlsx");
+    let mut editor = XlsxEditor::create(&path, "Data")?;
+    editor.set_cell("A1", "original")?;
+    assert!(editor.with_worksheet("Missing").is_err());
+    editor.set_cell("B1", "alive")?;
+    assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("original"));
+    assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("alive"));
     Ok(())
 }

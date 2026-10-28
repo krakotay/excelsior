@@ -1,4 +1,3 @@
-use pyo3::PyRefMut;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -18,27 +17,12 @@ fn index_to_excel_col(mut idx: usize) -> String {
 }
 
 fn excel_col_to_index(col: &str) -> PyResult<usize> {
-    let mut idx = 0usize;
-    let up = col.trim().to_ascii_uppercase();
-    if up.is_empty() || !up.bytes().all(|b| b.is_ascii_uppercase()) {
-        return Err(PyRuntimeError::new_err(format!(
-            "Invalid Excel column: {col}"
-        )));
-    }
-    for b in up.bytes() {
-        idx = idx * 26 + (b - b'A' + 1) as usize;
-    }
-    Ok(idx - 1)
+    rust_core::data::parse_column(col.trim()).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 fn normalize_column_letter(col: &str) -> PyResult<String> {
-    let normalized = col.trim().to_ascii_uppercase();
-    if normalized.is_empty() || !normalized.bytes().all(|b| b.is_ascii_uppercase()) {
-        return Err(PyRuntimeError::new_err(format!(
-            "Invalid Excel column: {col}"
-        )));
-    }
-    Ok(normalized)
+    excel_col_to_index(col)?;
+    Ok(col.trim().to_ascii_uppercase())
 }
 
 fn expand_column_selector(selector: &str) -> PyResult<Vec<String>> {
@@ -172,62 +156,95 @@ impl Editor {
         open_editor_with_optional_sheet(path, sheet_name)
     }
 
-    fn add_worksheet<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        sheet_name: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn clone(&self) -> Self {
+        Self {
+            editor: self.editor.clone(),
+        }
+    }
+
+    fn uses_1904_dates(&self) -> PyResult<bool> {
+        self.editor
+            .uses_1904_dates()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn write_typed_rows(&mut self, start: &str, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+        use rust_core::data::CellValue;
+        let iterator = rows.try_iter()?;
+        let mut python_error = None;
+        let converted = iterator.map(|item| {
+            let values = item.and_then(|row| row.extract::<Vec<(u8, String)>>());
+            match values {
+                Ok(values) => values
+                    .into_iter()
+                    .map(|(kind, value)| {
+                        Ok(match kind {
+                            0 => CellValue::Blank,
+                            1 => CellValue::Text(value),
+                            2 => CellValue::Number(value),
+                            3 => CellValue::Boolean(value == "1"),
+                            _ => anyhow::bail!("Unknown cell type"),
+                        })
+                    })
+                    .collect(),
+                Err(error) => {
+                    python_error = Some(error);
+                    Err(anyhow::anyhow!("Data row conversion failed"))
+                }
+            }
+        });
+        let result = self.editor.write_typed_table_at(start, converted);
+        if let Some(error) = python_error {
+            return Err(error);
+        }
+        result.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn force_column_formats(&mut self, formats: Vec<(usize, String)>) -> PyResult<()> {
+        self.editor
+            .force_column_formats(&formats)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn add_worksheet(&mut self, sheet_name: &str) -> PyResult<()> {
         let normalized = normalize_sheet_name(sheet_name)?;
-        slf.editor
+        self.editor
             .add_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn add_worksheet_at<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        sheet_name: &str,
-        index: usize,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn add_worksheet_at(&mut self, sheet_name: &str, index: usize) -> PyResult<()> {
         let normalized = normalize_sheet_name(sheet_name)?;
-        slf.editor
+        self.editor
             .add_worksheet_at(&normalized, index)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn with_worksheet<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        sheet_name: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn with_worksheet(&mut self, sheet_name: &str) -> PyResult<()> {
         let normalized = normalize_sheet_name(sheet_name)?;
-        slf.editor
+        self.editor
             .with_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn rename_worksheet<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        old_name: &str,
-        new_name: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn rename_worksheet(&mut self, old_name: &str, new_name: &str) -> PyResult<()> {
         let old_name = normalize_sheet_name(old_name)?;
         let new_name = normalize_sheet_name(new_name)?;
-        slf.editor
+        self.editor
             .rename_worksheet(&old_name, &new_name)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn delete_worksheet<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        sheet_name: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn delete_worksheet(&mut self, sheet_name: &str) -> PyResult<()> {
         let normalized = normalize_sheet_name(sheet_name)?;
-        slf.editor
+        self.editor
             .delete_worksheet(&normalized)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
     fn set_cell(&mut self, coords: &str, cell: String) -> PyResult<()> {
@@ -260,45 +277,40 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn save(&mut self, path: PathBuf) -> PyResult<()> {
-        self.editor
-            .save(path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    #[pyo3(signature = (path = None))]
+    fn save(&mut self, path: Option<PathBuf>) -> PyResult<()> {
+        match path {
+            Some(path) => self.editor.save(path),
+            None => self.editor.save_in_place(),
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn set_number_format<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-        fmt: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn set_number_format(&mut self, range: &str, fmt: &str) -> PyResult<()> {
+        self.editor
             .set_number_format(range, fmt)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_fill<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-        fmt: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn set_fill(&mut self, range: &str, fmt: &str) -> PyResult<()> {
+        self.editor
             .set_fill(range, fmt)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
     #[pyo3(signature = (range, name, size, bold = false, italic = false, align = None))]
-    fn set_font<'py>(
-        mut slf: PyRefMut<'py, Self>,
+    fn set_font(
+        &mut self,
         range: &str,
         name: &str,
         size: f32,
         bold: bool,
         italic: bool,
         align: Option<PyAlignSpec>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        let editor = &mut slf.editor;
+    ) -> PyResult<()> {
+        let editor = &mut self.editor;
 
         if let Some(py_align_spec) = align {
             editor
@@ -309,109 +321,80 @@ impl Editor {
                 .set_font(range, name, size, bold, italic)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_alignment<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-        spec: PyAlignSpec,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn set_alignment(&mut self, range: &str, spec: PyAlignSpec) -> PyResult<()> {
+        self.editor
             .set_alignment(range, &spec.0)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn merge_cells<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn merge_cells(&mut self, range: &str) -> PyResult<()> {
+        self.editor
             .merge_cells(range)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_border<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-        style: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn set_border(&mut self, range: &str, style: &str) -> PyResult<()> {
+        self.editor
             .set_border(range, style)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_column_width<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        col_letter: &str,
-        width: f64,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn set_column_width(&mut self, col_letter: &str, width: f64) -> PyResult<()> {
         let normalized = normalize_column_letter(col_letter)?;
         let width = validate_width(width)?;
-        slf.editor
+        self.editor
             .set_column_width(&normalized, width)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_column_width_range<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        col_range: &str,
-        width: f64,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn set_column_width_range(&mut self, col_range: &str, width: f64) -> PyResult<()> {
         let width = validate_width(width)?;
         for col in expand_column_selector(col_range)? {
-            slf.editor
+            self.editor
                 .set_column_width(&col, width)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_columns_width<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        col_letters: Vec<String>,
-        width: f64,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn set_columns_width(&mut self, col_letters: Vec<String>, width: f64) -> PyResult<()> {
         let width = validate_width(width)?;
         for selector in &col_letters {
             for col in expand_column_selector(selector)? {
-                slf.editor
+                self.editor
                     .set_column_width(&col, width)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
         }
-        Ok(slf)
+        Ok(())
     }
 
-    fn set_column_widths<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        widths: &Bound<'_, PyDict>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn set_column_widths(&mut self, widths: &Bound<'_, PyDict>) -> PyResult<()> {
         for (key, value) in widths.iter() {
             let selector: String = key.extract()?;
             let width: f64 = value.extract()?;
             let width = validate_width(width)?;
             for col in expand_column_selector(&selector)? {
-                slf.editor
+                self.editor
                     .set_column_width(&col, width)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
         }
-        Ok(slf)
+        Ok(())
     }
 
-    fn remove_style<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        range: &str,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.editor
+    fn remove_style(&mut self, range: &str) -> PyResult<()> {
+        self.editor
             .remove_style(range)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(slf)
+        Ok(())
     }
 }
 

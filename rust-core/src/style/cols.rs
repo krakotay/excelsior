@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use quick_xml::{events::Event, Reader};
+use quick_xml::{Reader, events::Event};
 
 use crate::XlsxEditor;
 use crate::style::util::find_bytes_from;
@@ -54,13 +54,30 @@ impl XlsxEditor {
         self.write_cols_map(cols_start, cols_end, &cols_map)
     }
 
+    pub(crate) fn set_column_style_ids(&mut self, styles: &[(u32, u32)]) -> Result<()> {
+        if styles.is_empty() {
+            return Ok(());
+        }
+        let (start, end) = self.ensure_cols_block()?;
+        let mut map = self.read_cols_map(start, end)?;
+        for &(column, style) in styles {
+            let prop = map.entry(column + 1).or_default();
+            prop.style = Some(style);
+            if prop.width.is_none() {
+                prop.width = Some(DEFAULT_COLUMN_WIDTH);
+                prop.custom_width = true;
+            }
+        }
+        self.write_cols_map(start, end, &map)
+    }
+
     fn ensure_cols_block(&mut self) -> Result<(usize, usize)> {
         use memchr::memmem;
 
         // уже есть?
         if let Some(start) = memmem::find(&self.sheet_xml, b"<cols") {
-            let end = find_bytes_from(&self.sheet_xml, b"</cols>", start)
-                .context("</cols> not found")?;
+            let end =
+                find_bytes_from(&self.sheet_xml, b"</cols>", start).context("</cols> not found")?;
             return Ok((start, end + "</cols>".len()));
         }
 
@@ -72,9 +89,9 @@ impl XlsxEditor {
         let (insert_after_dim, _inserted_len): (usize, usize) =
             if let Some(dim_start) = memmem::find(&self.sheet_xml, b"<dimension") {
                 // конец тега <dimension ...>
-                let dim_end =
-                    find_bytes_from(&self.sheet_xml, b">", dim_start).context("<dimension> not closed")?
-                        + 1;
+                let dim_end = find_bytes_from(&self.sheet_xml, b">", dim_start)
+                    .context("<dimension> not closed")?
+                    + 1;
                 (dim_end, 0)
             } else {
                 // создаём минимальный dimension прямо перед sheetData
@@ -104,7 +121,9 @@ impl XlsxEditor {
 
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"col" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"col" =>
+                {
                     let mut min = None;
                     let mut max = None;
                     let mut style = None;
@@ -114,8 +133,8 @@ impl XlsxEditor {
                     let mut hidden = false;
 
                     for a in e.attributes().with_checks(false).flatten() {
-                        let v = String::from_utf8_lossy(&a.value);
-                        match a.key.as_ref() {
+                        let v = a.value.clone();
+                        match a.key.as_ref().as_bytes() {
                             b"min" => min = Some(v.parse()?),
                             b"max" => max = Some(v.parse()?),
                             b"style" => style = v.parse().ok(),
@@ -128,6 +147,10 @@ impl XlsxEditor {
                     }
                     let min = min.unwrap_or(1);
                     let max = max.unwrap_or(min);
+                    anyhow::ensure!(
+                        min >= 1 && min <= max && max <= crate::data::MAX_COLUMNS as u32,
+                        "Invalid XLSX column range"
+                    );
                     let p = ColProp {
                         width,
                         style,

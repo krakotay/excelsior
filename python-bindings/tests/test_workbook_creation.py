@@ -83,9 +83,9 @@ def test_escaped_names_can_be_opened_switched_and_renamed(tmp_path):
     renamed = "Renamed & values"
     editor = Editor.create(path, name)
     editor.set_cell("A1", "original")
-    editor.add_worksheet("Other")
-    editor.with_worksheet(name)
-    editor.rename_worksheet(name, renamed)
+    editor = editor.add_worksheet("Other")
+    editor = editor.with_worksheet(name)
+    editor = editor.rename_worksheet(name, renamed)
     editor.save(path)
     assert Scanner(path).get_sheets() == [renamed, "Other"]
     editor = Editor.open(path, renamed)

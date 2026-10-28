@@ -5,6 +5,9 @@ set shell := ["cmd.exe", "/c"]
 build args="":
     just --justfile ../justfile build "{{args}}"
 
+sdist args="":
+    just --justfile ../justfile sdist "{{args}}"
+
 dev args="":
     just --justfile ../justfile dev "{{args}}"
 

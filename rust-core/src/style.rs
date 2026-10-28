@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::{fmt, str::FromStr};
 
 use crate::files_part::needs_xml_space_preserve;
-use crate::style::util::{bump_count, col_index, find_bytes_from};
+use crate::style::util::{bump_count, find_bytes_from};
 use crate::{FontKey, StyleIndex, StyleKey, XfParts, XlsxEditor};
 
 mod cols;
@@ -126,34 +126,30 @@ enum Target {
 }
 
 fn parse_target(s: &str) -> Result<Target> {
-    // столбец "A:" ?
-    if s.ends_with(':') && s[..s.len() - 1].bytes().all(|b| b.is_ascii_alphabetic()) {
-        return Ok(Target::Col(col_index(&s[..s.len() - 1]) as u32));
-    }
-    // строка "12:" ?
-    if s.ends_with(':') && s[..s.len() - 1].bytes().all(|b| b.is_ascii_digit()) {
-        return Ok(Target::Row(s[..s.len() - 1].parse()?));
-    }
-    // диапазон?
-    if let Some(colon) = s.find(':') {
-        let (a, b) = (&s[..colon], &s[colon + 1..]);
-        if a.ends_with(':') || b.is_empty() {
-            bail!("invalid range: {s}");
+    let s = s.to_ascii_uppercase();
+    if let Some((a, b)) = s.split_once(':') {
+        if b.is_empty() {
+            if a.bytes().all(|b| b.is_ascii_alphabetic()) {
+                return Ok(Target::Col(crate::data::parse_column(a)? as u32));
+            }
+            let row: u32 = a.parse().context("Invalid row selector")?;
+            anyhow::ensure!(
+                (1..=crate::data::MAX_ROWS).contains(&row),
+                "XLSX row limit exceeded"
+            );
+            return Ok(Target::Row(row));
         }
-        let (c0, r0) = split_coord(a);
-        let (c1, r1) = split_coord(b);
-        return Ok(Target::Rect { c0, r0, c1, r1 });
+        let (c0, r0) = crate::data::parse_coord(a)?;
+        let (c1, r1) = crate::data::parse_coord(b)?;
+        return Ok(Target::Rect {
+            c0: c0 as u32,
+            r0,
+            c1: c1 as u32,
+            r1,
+        });
     }
-
-    // ячейка "A12"
-    let p = s
-        .find(|c: char| c.is_ascii_digit())
-        .ok_or_else(|| anyhow::anyhow!("invalid"))?;
-    if s[..p].bytes().all(|b| b.is_ascii_alphabetic()) && s[p..].bytes().all(|b| b.is_ascii_digit())
-    {
-        return Ok(Target::Cell(s.to_owned()));
-    }
-    bail!("invalid range syntax: {s}");
+    crate::data::parse_coord(&s)?;
+    Ok(Target::Cell(s))
 }
 
 fn parse_open_column_selector(s: &str) -> Option<(u32, u32)> {
@@ -165,7 +161,7 @@ fn parse_open_column_selector(s: &str) -> Option<(u32, u32)> {
         return None;
     }
     if head.bytes().all(|b| b.is_ascii_alphabetic()) {
-        return Some((col_index(head) as u32, 1));
+        return crate::data::parse_column(head).ok().map(|c| (c as u32, 1));
     }
 
     let p = head.find(|c: char| c.is_ascii_digit())?;
@@ -183,7 +179,13 @@ fn parse_open_column_selector(s: &str) -> Option<(u32, u32)> {
     if row_start == 0 {
         return None;
     }
-    Some((col_index(&head[..p]) as u32, row_start))
+    if row_start > crate::data::MAX_ROWS {
+        return None;
+    }
+    Some((
+        crate::data::parse_column(&head[..p]).ok()? as u32,
+        row_start,
+    ))
 }
 
 impl StyleIndex {
@@ -213,13 +215,20 @@ impl StyleIndex {
         let mut max_custom = 163u32;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Start(ref e) | Event::Empty(ref e) if e.name().as_ref() == b"numFmt" => {
+                Event::Start(ref e) | Event::Empty(ref e)
+                    if e.name().as_ref().as_bytes() == b"numFmt" =>
+                {
                     let mut id = None::<u32>;
                     let mut code = None::<String>;
                     for a in e.attributes().with_checks(false).flatten() {
-                        match a.key.as_ref() {
-                            b"numFmtId" => id = Some(lexical_core::parse(&a.value)?),
-                            b"formatCode" => code = Some(String::from_utf8_lossy(&a.value).into()),
+                        match a.key.as_ref().as_bytes() {
+                            b"numFmtId" => id = Some(lexical_core::parse(a.value.as_bytes())?),
+                            b"formatCode" => {
+                                code = Some(
+                                    a.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                                        .into_owned(),
+                                )
+                            }
                             _ => {}
                         }
                     }
@@ -245,12 +254,12 @@ impl StyleIndex {
         let mut font_id = 0u32;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"fonts" => in_fonts = true,
-                Event::End(ref e) if e.name().as_ref() == b"fonts" => {
+                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"fonts" => in_fonts = true,
+                Event::End(ref e) if e.name().as_ref().as_bytes() == b"fonts" => {
                     // in_fonts = false;
                     break;
                 }
-                Event::Start(ref e) if in_fonts && e.name().as_ref() == b"font" => {
+                Event::Start(ref e) if in_fonts && e.name().as_ref().as_bytes() == b"font" => {
                     // читаем <font> целиком
                     let mut depth = 1;
                     let mut bold = false;
@@ -262,45 +271,48 @@ impl StyleIndex {
                         match rdr.read_event()? {
                             Event::Start(ref fe) => {
                                 depth += 1;
-                                match fe.name().as_ref() {
+                                match fe.name().as_ref().as_bytes() {
                                     b"b" => bold = true,
                                     b"i" => italic = true,
                                     b"sz" => {
                                         for a in fe.attributes().with_checks(false).flatten() {
-                                            if a.key.as_ref() == b"val" {
-                                                size = String::from_utf8_lossy(&a.value)
-                                                    .parse()
-                                                    .unwrap_or(11.0);
+                                            if a.key.as_ref().as_bytes() == b"val" {
+                                                size = a.value.clone().parse().unwrap_or(11.0);
                                             }
                                         }
                                     }
                                     b"name" => {
                                         for a in fe.attributes().with_checks(false).flatten() {
-                                            if a.key.as_ref() == b"val" {
-                                                name =
-                                                    String::from_utf8_lossy(&a.value).into_owned();
+                                            if a.key.as_ref().as_bytes() == b"val" {
+                                                name = a
+                                                    .normalized_value(
+                                                        quick_xml::XmlVersion::Implicit1_0,
+                                                    )?
+                                                    .into_owned();
                                             }
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                            Event::Empty(ref fe) => match fe.name().as_ref() {
+                            Event::Empty(ref fe) => match fe.name().as_ref().as_bytes() {
                                 b"b" => bold = true,
                                 b"i" => italic = true,
                                 b"sz" => {
                                     for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"val" {
-                                            size = String::from_utf8_lossy(&a.value)
-                                                .parse()
-                                                .unwrap_or(11.0);
+                                        if a.key.as_ref().as_bytes() == b"val" {
+                                            size = a.value.clone().parse().unwrap_or(11.0);
                                         }
                                     }
                                 }
                                 b"name" => {
                                     for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"val" {
-                                            name = String::from_utf8_lossy(&a.value).into_owned();
+                                        if a.key.as_ref().as_bytes() == b"val" {
+                                            name = a
+                                                .normalized_value(
+                                                    quick_xml::XmlVersion::Implicit1_0,
+                                                )?
+                                                .into_owned();
                                         }
                                     }
                                 }
@@ -334,12 +346,12 @@ impl StyleIndex {
         let mut fill_id = 0u32;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"fills" => in_fills = true,
-                Event::End(ref e) if e.name().as_ref() == b"fills" => {
+                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"fills" => in_fills = true,
+                Event::End(ref e) if e.name().as_ref().as_bytes() == b"fills" => {
                     // in_fills = false;
                     break;
                 }
-                Event::Start(ref e) if in_fills && e.name().as_ref() == b"fill" => {
+                Event::Start(ref e) if in_fills && e.name().as_ref().as_bytes() == b"fill" => {
                     // считываем <fill> целиком; учитываем только solid fgColor rgb
                     let mut depth = 1;
                     let mut rgb: Option<String> = None;
@@ -347,11 +359,10 @@ impl StyleIndex {
                     while depth > 0 {
                         match rdr.read_event()? {
                             Event::Start(ref fe) => {
-                                if fe.name().as_ref() == b"fgColor" {
+                                if fe.name().as_ref().as_bytes() == b"fgColor" {
                                     for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"rgb" {
-                                            let mut v =
-                                                String::from_utf8_lossy(&a.value).into_owned();
+                                        if a.key.as_ref().as_bytes() == b"rgb" {
+                                            let mut v = a.value.clone().into_owned();
                                             v.make_ascii_uppercase();
                                             rgb = Some(v);
                                         }
@@ -360,11 +371,10 @@ impl StyleIndex {
                                 depth += 1;
                             }
                             Event::Empty(ref fe) => {
-                                if fe.name().as_ref() == b"fgColor" {
+                                if fe.name().as_ref().as_bytes() == b"fgColor" {
                                     for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"rgb" {
-                                            let mut v =
-                                                String::from_utf8_lossy(&a.value).into_owned();
+                                        if a.key.as_ref().as_bytes() == b"rgb" {
+                                            let mut v = a.value.clone().into_owned();
                                             v.make_ascii_uppercase();
                                             rgb = Some(v);
                                         }
@@ -396,19 +406,21 @@ impl StyleIndex {
         let mut border_id = 0u32;
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"borders" => in_borders = true,
-                Event::End(ref e) if e.name().as_ref() == b"borders" => {
+                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"borders" => {
+                    in_borders = true
+                }
+                Event::End(ref e) if e.name().as_ref().as_bytes() == b"borders" => {
                     // in_borders = false;
                     break;
                 }
-                Event::Start(ref e) if in_borders && e.name().as_ref() == b"border" => {
+                Event::Start(ref e) if in_borders && e.name().as_ref().as_bytes() == b"border" => {
                     let mut depth = 1;
                     let mut styles = [None, None, None, None]; // left,right,top,bottom
 
                     while depth > 0 {
                         match rdr.read_event()? {
                             Event::Start(ref be) => {
-                                let side = match be.name().as_ref() {
+                                let side = match be.name().as_ref().as_bytes() {
                                     b"left" => Some(0),
                                     b"right" => Some(1),
                                     b"top" => Some(2),
@@ -417,17 +429,15 @@ impl StyleIndex {
                                 };
                                 if let Some(i) = side {
                                     for a in be.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"style" {
-                                            styles[i] = Some(
-                                                String::from_utf8_lossy(&a.value).into_owned(),
-                                            );
+                                        if a.key.as_ref().as_bytes() == b"style" {
+                                            styles[i] = Some(a.value.clone().into_owned());
                                         }
                                     }
                                 }
                                 depth += 1;
                             }
                             Event::Empty(ref be) => {
-                                let side = match be.name().as_ref() {
+                                let side = match be.name().as_ref().as_bytes() {
                                     b"left" => Some(0),
                                     b"right" => Some(1),
                                     b"top" => Some(2),
@@ -436,10 +446,8 @@ impl StyleIndex {
                                 };
                                 if let Some(i) = side {
                                     for a in be.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref() == b"style" {
-                                            styles[i] = Some(
-                                                String::from_utf8_lossy(&a.value).into_owned(),
-                                            );
+                                        if a.key.as_ref().as_bytes() == b"style" {
+                                            styles[i] = Some(a.value.clone().into_owned());
                                         }
                                     }
                                 }
@@ -475,14 +483,14 @@ impl StyleIndex {
 
         while let Ok(ev) = rdr.read_event() {
             match ev {
-                Event::Start(ref e) if e.name().as_ref() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref() == b"cellXfs" => {
+                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"cellXfs" => in_xfs = true,
+                Event::End(ref e) if e.name().as_ref().as_bytes() == b"cellXfs" => {
                     // in_xfs = false;
                     break;
                 }
 
                 Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref() == b"xf" =>
+                    if in_xfs && e.name().as_ref().as_bytes() == b"xf" =>
                 {
                     let mut num_fmt_id = 0u32;
                     let mut font_id: Option<u32> = None;
@@ -490,12 +498,19 @@ impl StyleIndex {
                     let mut border_id: Option<u32> = None;
 
                     for a in e.attributes().with_checks(false).flatten() {
-                        match a.key.as_ref() {
-                            b"numFmtId" => num_fmt_id = lexical_core::parse(&a.value).unwrap_or(0),
-                            b"fontId" => font_id = Some(lexical_core::parse(&a.value).unwrap_or(0)),
-                            b"fillId" => fill_id = Some(lexical_core::parse(&a.value).unwrap_or(0)),
+                        match a.key.as_ref().as_bytes() {
+                            b"numFmtId" => {
+                                num_fmt_id = lexical_core::parse(a.value.as_bytes()).unwrap_or(0)
+                            }
+                            b"fontId" => {
+                                font_id = Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
+                            }
+                            b"fillId" => {
+                                fill_id = Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
+                            }
                             b"borderId" => {
-                                border_id = Some(lexical_core::parse(&a.value).unwrap_or(0))
+                                border_id =
+                                    Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
                             }
                             _ => {}
                         }
@@ -509,11 +524,11 @@ impl StyleIndex {
                             match rdr.read_event()? {
                                 Event::Start(ref ae) => {
                                     depth += 1;
-                                    if ae.name().as_ref() == b"alignment" {
+                                    if ae.name().as_ref().as_bytes() == b"alignment" {
                                         let mut spec = AlignSpec::default();
                                         for a in ae.attributes().with_checks(false).flatten() {
-                                            let v = String::from_utf8_lossy(&a.value).into_owned();
-                                            match a.key.as_ref() {
+                                            let v = a.value.clone().into_owned();
+                                            match a.key.as_ref().as_bytes() {
                                                 b"horizontal" => spec.horiz = Some(v.parse()?),
                                                 b"vertical" => spec.vert = Some(v.parse()?),
                                                 b"wrapText" => {
@@ -588,8 +603,14 @@ impl XlsxEditor {
         }
 
         if let Some((col0, row_start)) = parse_open_column_selector(range) {
-            if patch.num_fmt_code.is_some() || patch.font.is_some() || patch.fill.is_some() || patch.border.is_some() {
-                bail!("open column style patch currently supports alignment or number format via dedicated APIs only");
+            if patch.num_fmt_code.is_some()
+                || patch.font.is_some()
+                || patch.fill.is_some()
+                || patch.border.is_some()
+            {
+                bail!(
+                    "open column style patch currently supports alignment or number format via dedicated APIs only"
+                );
             }
             self.apply_patch_col_one_pass(col0, row_start, &patch)?;
             if row_start == 1 && patch.align.is_some() {
@@ -757,7 +778,11 @@ impl XlsxEditor {
     }
 
     pub fn set_column_width(&mut self, col_letter: &str, width: f64) -> Result<&mut Self> {
-        let col0 = col_index(col_letter) as u32; // 0-based
+        let col0 = crate::data::parse_column(col_letter)? as u32;
+        anyhow::ensure!(
+            width.is_finite() && width > 0.0 && width <= 255.0,
+            "Column width must be in range (0, 255]"
+        );
         self.set_column_properties(col0, Some(width), None)?;
         Ok(self)
     }
@@ -772,15 +797,15 @@ impl XlsxEditor {
         cache: &mut HashMap<Option<u32>, u32>,
         old_sid: Option<u32>,
         patch: &StyleParts,
-    ) -> u32 {
+    ) -> Result<u32> {
         if let Some(&sid) = cache.get(&old_sid) {
-            return sid;
+            return Ok(sid);
         }
-        let old_parts = self.read_style_parts(old_sid).unwrap();
+        let old_parts = self.read_style_parts(old_sid)?;
         let merged = merge_style_parts(old_parts, patch);
-        let sid = self.ensure_style_from_parts(&merged).unwrap();
+        let sid = self.ensure_style_from_parts(&merged)?;
         cache.insert(old_sid, sid);
-        sid
+        Ok(sid)
     }
 
     /// Быстрый однопроходный патч диапазона: правит стиль только у существующих <c ...>.
@@ -853,7 +878,7 @@ impl XlsxEditor {
                         range_col_end,
                         &mut sid_cache,
                         patch,
-                    );
+                    )?;
                     next_row_needed += 1;
                 }
             }
@@ -876,7 +901,7 @@ impl XlsxEditor {
                     range_col_end,
                     &mut sid_cache,
                     patch,
-                );
+                )?;
                 next_row_needed += 1;
             }
 
@@ -955,7 +980,7 @@ impl XlsxEditor {
                                 None
                             };
 
-                            let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch);
+                            let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
 
                             // заменить/вставить s="..."
                             if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
@@ -992,7 +1017,7 @@ impl XlsxEditor {
                 if *flag == 0 {
                     let col_idx = range_col_start + offset as u32;
                     let coord = format!("{}{}", col_letter(col_idx), cur_row);
-                    let sid = self.get_or_make_sid(&mut sid_cache, None, patch);
+                    let sid = self.get_or_make_sid(&mut sid_cache, None, patch)?;
                     let cell_tag = format!(r#"<c r="{}" s="{}"/>"#, coord, sid);
                     dst.extend_from_slice(cell_tag.as_bytes());
                 }
@@ -1014,7 +1039,7 @@ impl XlsxEditor {
                 range_col_end,
                 &mut sid_cache,
                 patch,
-            );
+            )?;
             next_row_needed += 1;
         }
 
@@ -1023,8 +1048,8 @@ impl XlsxEditor {
             dst.extend_from_slice(&tail_rows);
             dst.extend_from_slice(&src[i..]);
         } else {
-            let sheet_data_end = memmem::rfind(&src, b"</sheetData>")
-                .context("</sheetData> tag not found")?;
+            let sheet_data_end =
+                memmem::rfind(&src, b"</sheetData>").context("</sheetData> tag not found")?;
             dst.extend_from_slice(&src[..sheet_data_end]);
             dst.extend_from_slice(&tail_rows);
             dst.extend_from_slice(&src[sheet_data_end..]);
@@ -1041,8 +1066,8 @@ impl XlsxEditor {
         col_end: u32,
         sid_cache: &mut HashMap<Option<u32>, u32>,
         patch: &StyleParts,
-    ) {
-        let sid = self.get_or_make_sid(sid_cache, None, patch);
+    ) -> Result<()> {
+        let sid = self.get_or_make_sid(sid_cache, None, patch)?;
         dst.extend_from_slice(format!(r#"<row r="{}">"#, row).as_bytes());
         for col_idx in col_start..=col_end {
             let coord = format!("{}{}", col_letter(col_idx), row);
@@ -1050,6 +1075,7 @@ impl XlsxEditor {
             dst.extend_from_slice(cell_tag.as_bytes());
         }
         dst.extend_from_slice(b"</row>");
+        Ok(())
     }
 
     fn apply_patch_col_one_pass(
@@ -1114,7 +1140,7 @@ impl XlsxEditor {
                 } else {
                     None
                 };
-                let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch);
+                let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
 
                 if let Some(sp) = find_bytes_from(&cell, b" s=\"", 0) {
                     let s0 = sp + 4;
@@ -1214,7 +1240,7 @@ impl XlsxEditor {
                         } else {
                             None
                         };
-                        let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch);
+                        let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
 
                         if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
                             let s0 = sp + 4;
@@ -1345,11 +1371,7 @@ impl XlsxEditor {
         match parse_target(range)? {
             Target::Cell(cell) => {
                 let sid = self.cell_style_id(&cell)?;
-                let new_sid = *sid_cache.entry(sid).or_insert_with(|| {
-                    let old = self.read_style_parts(sid).unwrap();
-                    let merged = merge_style_parts(old, &patch);
-                    self.ensure_style_from_parts(&merged).unwrap()
-                });
+                let new_sid = self.get_or_make_sid(&mut sid_cache, sid, &patch)?;
                 self.apply_style_to_cell(&cell, new_sid)?;
             }
             Target::Rect { c0, r0, c1, r1 } => {
@@ -1387,7 +1409,10 @@ impl XlsxEditor {
         let num_fmt_code = if num_fmt_id == 0 {
             None
         } else {
-            self.style_ix_mut()?.numfmt_code_by_id.get(&num_fmt_id).cloned()
+            self.style_ix_mut()?
+                .numfmt_code_by_id
+                .get(&num_fmt_id)
+                .cloned()
         };
 
         Ok(StyleParts {
@@ -1612,7 +1637,9 @@ fn seed_builtin_num_fmts(ix: &mut StyleIndex) {
         ("@", 49),
     ] {
         ix.numfmt_by_code.entry(code.to_string()).or_insert(id);
-        ix.numfmt_code_by_id.entry(id).or_insert_with(|| code.to_string());
+        ix.numfmt_code_by_id
+            .entry(id)
+            .or_insert_with(|| code.to_string());
     }
 }
 
@@ -1693,7 +1720,9 @@ impl XlsxEditor {
         if let Some(id) = builtin_num_fmt_id(code) {
             let ix = self.style_ix_mut()?;
             ix.numfmt_by_code.entry(code.to_string()).or_insert(id);
-            ix.numfmt_code_by_id.entry(id).or_insert_with(|| code.to_string());
+            ix.numfmt_code_by_id
+                .entry(id)
+                .or_insert_with(|| code.to_string());
             return Ok(id);
         }
 
@@ -1717,7 +1746,8 @@ impl XlsxEditor {
         };
 
         // C) правим XML
-        let tag = format!(r#"<numFmt numFmtId="{new_id}" formatCode="{code}"/>"#);
+        let escaped_code = quick_xml::escape::escape(code);
+        let tag = format!(r#"<numFmt numFmtId="{new_id}" formatCode="{escaped_code}"/>"#);
         if let Some(end) = memmem::rfind(&self.styles_xml, b"</numFmts>") {
             // блок уже есть → просто дописываем внутрь и бампим count
             self.styles_xml.splice(end..end, tag.bytes());
@@ -1751,6 +1781,10 @@ impl XlsxEditor {
     }
 
     fn ensure_font(&mut self, name: &str, size: f32, bold: bool, italic: bool) -> Result<u32> {
+        anyhow::ensure!(
+            size.is_finite() && size > 0.0,
+            "Font size must be finite and positive"
+        );
         let key = FontKey {
             name: name.to_string(),
             size_100: (size * 100.0).round() as u32,
@@ -1786,7 +1820,10 @@ impl XlsxEditor {
             xml.push_str("<i/>");
         }
         xml.push_str(&format!(r#"<sz val="{}"/>"#, (key.size_100 as f32) / 100.0));
-        xml.push_str(&format!(r#"<name val="{}"/>"#, name));
+        xml.push_str(&format!(
+            r#"<name val="{}"/>"#,
+            quick_xml::escape::escape(name)
+        ));
         xml.push_str("</font>");
         self.styles_xml.splice(insert..insert, xml.bytes());
         bump_count(&mut self.styles_xml, b"<fonts", b"count=\"")?;
@@ -2194,5 +2231,80 @@ impl XlsxEditor {
 
         self.sheet_xml = dst;
         Ok(())
+    }
+}
+
+impl XlsxEditor {
+    /// Apply column defaults and override existing cell number formats in one pass.
+    /// Unlike a rectangle style, this never materializes a million empty cells.
+    pub fn force_column_formats(&mut self, formats: &[(usize, String)]) -> Result<()> {
+        let mut patches = HashMap::new();
+        let mut defaults = Vec::with_capacity(formats.len());
+        for (col, fmt) in formats {
+            anyhow::ensure!(
+                *col < crate::data::MAX_COLUMNS,
+                "XLSX column limit exceeded"
+            );
+            let patch = StyleParts {
+                num_fmt_code: Some(fmt.clone()),
+                ..Default::default()
+            };
+            let sid = self.ensure_style_from_parts(&patch)?;
+            defaults.push((*col as u32, sid));
+            patches.insert(*col, patch);
+        }
+        self.set_column_style_ids(&defaults)?;
+        let src = std::mem::take(&mut self.sheet_xml);
+        let result = (|| -> Result<Vec<u8>> {
+            let mut out = Vec::with_capacity(src.len());
+            let mut cursor = 0;
+            let mut search = 0;
+            let mut cache = HashMap::new();
+            while let Some(offset) = memmem::find(&src[search..], b"<c ") {
+                let begin = search + offset;
+                let end = find_bytes_from(&src, b">", begin).context("Malformed cell")?;
+                if let Some(col) = crate::extract_cell_col_idx(&src[begin..=end]) {
+                    if let Some(patch) = patches.get(&col) {
+                        let old_sid = crate::extract_style_id(&src[begin..=end]);
+                        let sid = if let Some(sid) = cache.get(&(col, old_sid)) {
+                            *sid
+                        } else {
+                            let old = self.read_style_parts(old_sid)?;
+                            let sid =
+                                self.ensure_style_from_parts(&merge_style_parts(old, patch))?;
+                            cache.insert((col, old_sid), sid);
+                            sid
+                        };
+                        out.extend_from_slice(&src[cursor..begin]);
+                        if let Some(offset) = memmem::find(&src[begin..end], b" s=\"") {
+                            let value_start = begin + offset + 4;
+                            let value_end = find_bytes_from(&src, b"\"", value_start)
+                                .context("Malformed style")?;
+                            out.extend_from_slice(&src[begin..value_start]);
+                            out.extend_from_slice(sid.to_string().as_bytes());
+                            out.extend_from_slice(&src[value_end..=end]);
+                        } else {
+                            out.extend_from_slice(&src[begin..begin + 2]);
+                            out.extend_from_slice(format!(" s=\"{sid}\"").as_bytes());
+                            out.extend_from_slice(&src[begin + 2..=end]);
+                        }
+                        cursor = end + 1;
+                    }
+                }
+                search = end + 1;
+            }
+            out.extend_from_slice(&src[cursor..]);
+            Ok(out)
+        })();
+        match result {
+            Ok(out) => {
+                self.sheet_xml = out;
+                Ok(())
+            }
+            Err(error) => {
+                self.sheet_xml = src;
+                Err(error)
+            }
+        }
     }
 }

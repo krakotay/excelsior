@@ -24,8 +24,8 @@ impl XlsxEditor {
             .split(',')
             .map(|s| s.trim().to_ascii_uppercase())
             .collect();
-        if targets.is_empty() {
-            bail!("no columns supplied")
+        for column in &targets {
+            crate::data::parse_column(column)?;
         }
 
         let mut reader = Reader::from_reader(self.sheet_xml.as_slice());
@@ -34,11 +34,12 @@ impl XlsxEditor {
 
         while let Ok(ev) = reader.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"c" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"c" =>
+                {
                     // locate the coordinate attribute r="A1"
                     if let Some(coord) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                        (a.key.as_ref() == b"r")
-                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                        (a.key.as_ref().as_bytes() == b"r").then(|| a.value.clone().into_owned())
                     }) {
                         let (col, row) = split_coord(&coord);
                         if targets.contains(&col) && row > last_row {
@@ -64,11 +65,6 @@ impl XlsxEditor {
             bail!("range must be in the form A:E")
         }
         // Reuse helpers from outer function
-        fn letters_to_col_idx(s: &str) -> usize {
-            s.bytes().fold(0, |acc, b| {
-                acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize
-            }) - 1
-        }
         fn split_coord(coord: &str) -> (String, u32) {
             let pos = coord
                 .find(|c: char| c.is_ascii_digit())
@@ -81,8 +77,8 @@ impl XlsxEditor {
         let start = parts[0].trim().to_ascii_uppercase();
         let end = parts[1].trim().to_ascii_uppercase();
 
-        let start_idx = letters_to_col_idx(&start);
-        let end_idx = letters_to_col_idx(&end);
+        let start_idx = crate::data::parse_column(&start)?;
+        let end_idx = crate::data::parse_column(&end)?;
         if start_idx > end_idx {
             bail!("invalid range order")
         }
@@ -93,13 +89,14 @@ impl XlsxEditor {
 
         while let Ok(ev) = reader.read_event() {
             match ev {
-                Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"c" => {
+                Event::Empty(ref e) | Event::Start(ref e)
+                    if e.name().as_ref().as_bytes() == b"c" =>
+                {
                     if let Some(coord) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                        (a.key.as_ref() == b"r")
-                            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                        (a.key.as_ref().as_bytes() == b"r").then(|| a.value.clone().into_owned())
                     }) {
                         let (col, row) = split_coord(&coord);
-                        let idx = letters_to_col_idx(&col);
+                        let idx = crate::data::parse_column(&col)?;
                         if idx >= start_idx && idx <= end_idx {
                             let vec_idx = idx - start_idx;
                             if row > per_col_last[vec_idx] {

@@ -6,7 +6,7 @@ from excelsior import Editor, Scanner
 def test_scan_and_open_generated_workbook(tmp_path: Path) -> None:
     path = tmp_path / "scanner.xlsx"
     editor = Editor.create(path, "dog")
-    editor.add_worksheet("cat")
+    editor = editor.add_worksheet("cat")
     editor.save(path)
 
     scanner = Scanner(path)

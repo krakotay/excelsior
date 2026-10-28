@@ -10,9 +10,9 @@ test = true
 
 [dependencies]
 # mimalloc = "0.1.47"
-quick-xml = "0.39.0"
-tempfile = "3.23.0"
+quick-xml = "0.42.0"
+tempfile = "3.27.0"
 zip.workspace = true
 anyhow.workspace = true
-memchr = { version = "2.8.0", default-features = false }
+memchr = { version = "2.8.3", default-features = false }
 lexical-core = "1.0.6"

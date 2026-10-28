@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.15.0
+
+- Allow `save()` to use the original create/open path; `save(other_path)` writes a
+  copy without rebinding the editor. Remember absolute paths across cwd changes.
+
+- Breaking Python API: methods returning Editor now return independent copies;
+  methods returning None mutate. Update fluent calls to assign their result.
+- Preserve dataframe cell types, including long numeric-looking strings and
+  formula-looking text, without importing Polars or converting through Arrow.
+- Force whole-column number formats from dataframe dtypes by default;
+  `force_column_formats=False` preserves template formats.
+- Keep repeated appends efficient by inserting new row XML at the tail.
+- Stream rows into one XML merge instead of materializing multiple full tables;
+  apply all dataframe column formats in one cell pass.
+- Handle NaN/infinity as text, native booleans, decimal scale, time/duration,
+  and the workbook's 1904 date system.
+- Fix columns beyond Z, coordinate/selector validation, failed sheet selection,
+  self-closing rows, and use atomic replacement when saving workbooks.
+- Adapt XML name/value handling to quick-xml 0.42, including normalized escaped attributes.
+- Add a portable source-distribution recipe and document local uv installation.
+
 ## 0.14.0
 
 - Build and test CPython 3.10–3.15 wheels for Linux, Windows, and macOS;

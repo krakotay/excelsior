@@ -31,8 +31,8 @@ def test_with_polars_formats_bool_and_datetime_columns(tmp_path: Path) -> None:
     ws = get_sheet(out, "Data")
 
     assert ws["B3"].value == "name"
-    assert ws["C4"].value == "TRUE"
-    assert ws["C5"].value == "FALSE"
+    assert ws["C4"].value is True
+    assert ws["C5"].value is False
 
     assert ws["D4"].is_date is True
     assert ws["D5"].is_date is True
@@ -51,7 +51,7 @@ def test_sliced_frame_and_chained_editor_do_not_use_arrow(tmp_path, monkeypatch)
     frame = pl.DataFrame({"name": ["zero", "one", "two"], "value": [0, 1, 2]})
     path = tmp_path / "sliced.xlsx"
     editor = Editor.create(path)
-    assert editor.add_worksheet("Data") is editor
+    editor = editor.add_worksheet("Data")
     editor.with_polars(frame.slice(1, 2), "b3")
     editor.save(path)
     ws = get_sheet(path, "Data")
@@ -121,5 +121,5 @@ def test_python_frame_protocol_and_date_values(tmp_path):
     ws = get_sheet(path, "Sheet1")
     assert ws["A2"].value == datetime(1900, 1, 1)
     assert ws["B2"].value == datetime(2025, 1, 2, 3, 4, 5)
-    assert ws["C2"].value == "TRUE"
+    assert ws["C2"].value is True
     assert ws["D2"].value in (None, "")

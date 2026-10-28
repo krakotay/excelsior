@@ -1,65 +1,191 @@
-"""Python adapters over the Rust editor; no Polars or Arrow imports required."""
+"""Python dataframe adaptation and explicit value/mutation semantics."""
 
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+from math import isfinite
 from os import PathLike
 import re
-from typing import Any
+from typing import Any, TypeVar
 
-from .excelsior import Editor as _Editor, Scanner as _Scanner, create_excel
+from .excelsior import AlignSpec, Editor as _Editor, Scanner as _Scanner, create_excel
+
+_EditorT = TypeVar("_EditorT", bound="Editor")
 
 _MAX_ROWS = 1_048_576
 _MAX_COLUMNS = 16_384
+_FLOAT_FORMAT = "0.###############"
 
 
-def _column_name(index: int) -> str:
-    result = ""
-    index += 1
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
+def _dtype_format(dtype: Any) -> str | None:
+    name = str(dtype).split("(", 1)[0]
+    if name.startswith(("Int", "UInt")):
+        return "0"
+    if name.startswith("Float"):
+        return _FLOAT_FORMAT
+    if name == "Decimal":
+        scale = getattr(dtype, "scale", 0) or 0
+        return "0" + ("." + "0" * scale if scale else "")
+    if name in {"String", "Utf8", "Categorical", "Enum"}:
+        return "@"
+    if name == "Date":
+        return "yyyy-mm-dd"
+    if name == "Datetime":
+        return "yyyy-mm-dd hh:mm:ss"
+    if name == "Time":
+        return "hh:mm:ss.000"
+    if name == "Duration":
+        return "[h]:mm:ss.000"
+    return None
 
 
-def _excel_value(value: Any) -> tuple[str, str | None]:
+def _excel_value(value: Any, date_1904: bool) -> tuple[tuple[int, str], str | None]:
+    # The small tagged-cell protocol is independent of Polars and Arrow.
     if value is None:
-        return "", None
+        return (0, ""), None
     if isinstance(value, bool):
-        return ("TRUE" if value else "FALSE"), None
+        return (3, "1" if value else "0"), None
     if isinstance(value, (datetime, date)):
         # XLSX has no timezone field: retain the displayed local date and time.
         day = value.date() if isinstance(value, datetime) else value
-        serial = (day - date(1899, 12, 30)).days
-        if 0 < serial < 61:  # Excel's fictitious 1900-02-29.
-            serial -= 1
+        serial = (day - date(1904, 1, 1) if date_1904 else day - date(1899, 12, 30)).days
+        if not date_1904 and 0 < serial < 61:
+            serial -= 1  # Excel's fictitious 1900-02-29.
         fmt = "yyyy-mm-dd"
         if isinstance(value, datetime):
-            seconds = (
-                value.hour * 3600 + value.minute * 60 + value.second
-                + value.microsecond / 1_000_000
-            )
-            serial += seconds / 86_400
+            serial += (value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1_000_000) / 86_400
             fmt = "yyyy-mm-dd hh:mm:ss"
-        return f"{serial:.15f}".rstrip("0").rstrip("."), fmt
-    return str(value), None
+        return (2, str(serial)), fmt
+    if isinstance(value, time):
+        seconds = value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1_000_000
+        return (2, str(seconds / 86_400)), "hh:mm:ss.000"
+    if isinstance(value, timedelta):
+        return (2, str(value.total_seconds() / 86_400)), "[h]:mm:ss.000"
+    if isinstance(value, int):
+        return (2, str(value)), "0"
+    if isinstance(value, (float, Decimal)):
+        if not isfinite(value):
+            # Excel has no numeric NaN/infinity; retain their spelling as text.
+            return (1, str(value)), None
+        return (2, str(value)), _FLOAT_FORMAT
+    return (1, str(value)), "@"
 
 
-class Editor(_Editor):
+class Editor:
+    """XLSX editor with two explicit method contracts.
+
+    Methods returning Editor operate on an independent copy; assign the result.
+    Methods returning None mutate this instance (save also writes to disk).
+    """
+
+    def __init__(self, path: str | PathLike[str], sheet_name: str | None = None) -> None:
+        self._native = _Editor(path, sheet_name)
+
     @classmethod
-    def create(cls, path: str | PathLike[str], sheet_name: str = "Sheet1") -> "Editor":
+    def create(cls: type[_EditorT], path: str | PathLike[str], sheet_name: str = "Sheet1") -> _EditorT:
         """Create an empty XLSX at path and open it. Replaces an existing file."""
         create_excel(path, sheet_name)
         return cls(path, sheet_name)
 
     @classmethod
-    def open(cls, path: str | PathLike[str], sheet_name: str | None = None) -> "Editor":
-        """Open a worksheet, defaulting to the first sheet."""
+    def open(cls: type[_EditorT], path: str | PathLike[str], sheet_name: str | None = None) -> _EditorT:
         return cls(path, sheet_name)
 
-    def with_polars(self, py_df: Any, start_cell: str | None = None) -> None:
-        """Write headers and rows using only DataFrame.columns and iter_rows().
+    def copy(self: _EditorT) -> _EditorT:
+        """Return an independent snapshot, including all unsaved edits."""
+        result = type(self).__new__(type(self))
+        result.__dict__ = self.__dict__.copy()
+        result._native = self._native.clone()
+        return result
 
-        Polars is neither imported nor converted through Arrow. Any installed
-        version exposing these public APIs can supply the DataFrame.
+    def __copy__(self: _EditorT) -> _EditorT:
+        return self.copy()
+
+    def __deepcopy__(self: _EditorT, memo: dict) -> _EditorT:
+        from copy import deepcopy
+        result = type(self).__new__(type(self))
+        memo[id(self)] = result
+        result.__dict__ = {k: self._native.clone() if k == "_native" else deepcopy(v, memo) for k, v in self.__dict__.items()}
+        return result
+
+    def _updated(self: _EditorT, method: str, *args: Any) -> _EditorT:
+        result = self.copy()
+        getattr(result._native, method)(*args)
+        return result
+
+    def add_worksheet(self: _EditorT, sheet_name: str) -> _EditorT:
+        return self._updated("add_worksheet", sheet_name)
+
+    def add_worksheet_at(self: _EditorT, sheet_name: str, index: int) -> _EditorT:
+        return self._updated("add_worksheet_at", sheet_name, index)
+
+    def with_worksheet(self: _EditorT, sheet_name: str) -> _EditorT:
+        return self._updated("with_worksheet", sheet_name)
+
+    def rename_worksheet(self: _EditorT, old_name: str, new_name: str) -> _EditorT:
+        return self._updated("rename_worksheet", old_name, new_name)
+
+    def delete_worksheet(self: _EditorT, sheet_name: str) -> _EditorT:
+        return self._updated("delete_worksheet", sheet_name)
+
+    def set_number_format(self: _EditorT, range: str, fmt: str) -> _EditorT:
+        return self._updated("set_number_format", range, fmt)
+
+    def set_fill(self: _EditorT, range: str, rgb: str) -> _EditorT:
+        return self._updated("set_fill", range, rgb)
+
+    def merge_cells(self: _EditorT, range: str) -> _EditorT:
+        return self._updated("merge_cells", range)
+
+    def set_border(self: _EditorT, range: str, style: str) -> _EditorT:
+        return self._updated("set_border", range, style)
+
+    def set_font(self: _EditorT, range: str, name: str, size: float, bold: bool = False, italic: bool = False, align: AlignSpec | None = None) -> _EditorT:
+        return self._updated("set_font", range, name, size, bold, italic, align)
+
+    def set_alignment(self: _EditorT, range: str, spec: AlignSpec) -> _EditorT:
+        return self._updated("set_alignment", range, spec)
+
+    def set_column_width(self: _EditorT, col_letter: str, width: float) -> _EditorT:
+        return self._updated("set_column_width", col_letter, width)
+
+    def set_column_width_range(self: _EditorT, col_range: str, width: float) -> _EditorT:
+        return self._updated("set_column_width_range", col_range, width)
+
+    def set_columns_width(self: _EditorT, col_letters: list[str], width: float) -> _EditorT:
+        return self._updated("set_columns_width", col_letters, width)
+
+    def set_column_widths(self: _EditorT, widths: dict[str, float]) -> _EditorT:
+        return self._updated("set_column_widths", widths)
+
+    def remove_style(self: _EditorT, range: str) -> _EditorT:
+        return self._updated("remove_style", range)
+
+    def set_cell(self, coords: str, cell: str) -> None:
+        self._native.set_cell(coords, cell)
+
+    def append_row(self, cells: list[str]) -> None:
+        self._native.append_row(cells)
+
+    def append_table_at(self, cells: list[list[str]], start_cell: str) -> None:
+        self._native.append_table_at(cells, start_cell)
+
+    def last_row_index(self, col_name: str) -> int:
+        return self._native.last_row_index(col_name)
+
+    def last_rows_index(self, col_name: str) -> list[int]:
+        return self._native.last_rows_index(col_name)
+
+    def save(self, path: str | PathLike[str] | None = None) -> None:
+        """Save to the original path, or write a copy without changing that path."""
+        self._native.save(path)
+
+    def with_polars(self, py_df: Any, start_cell: str | None = None, *, force_column_formats: bool = True) -> None:
+        """Mutate this worksheet with typed headers/rows from a dataframe.
+
+        By default dtype number formats override the entire destination columns,
+        including existing cells outside the written area. False preserves all
+        template formats. String values remain text in either mode. NaN/inf are
+        written as text. No Polars import or Arrow conversion is performed.
         """
         start = "A1" if start_cell is None else start_cell
         match = re.fullmatch(r"([A-Za-z]+)([1-9][0-9]*)", start)
@@ -73,34 +199,38 @@ class Editor(_Editor):
         start_row = int(row_text)
         if start_column >= _MAX_COLUMNS or start_row > _MAX_ROWS:
             raise ValueError("Start cell exceeds XLSX worksheet limits")
-
         columns = list(py_df.columns)
         if not columns:
             return
         if start_column + len(columns) > _MAX_COLUMNS:
             raise ValueError("DataFrame exceeds XLSX column limit")
-        table = [columns]
-        formats: list[str | None] = [None] * len(columns)
-        for row in py_df.iter_rows():
-            if start_row + len(table) > _MAX_ROWS:
-                raise ValueError("DataFrame exceeds XLSX row limit (including header)")
-            if len(row) != len(columns):
-                raise ValueError("DataFrame row width does not match its columns")
-            values = []
-            for index, value in enumerate(row):
-                text, fmt = _excel_value(value)
-                values.append(text)
-                if fmt is not None and formats[index] != "yyyy-mm-dd hh:mm:ss":
-                    formats[index] = fmt
-            table.append(values)
+        height = getattr(py_df, "height", None)
+        if height is not None and start_row + height > _MAX_ROWS:
+            raise ValueError("DataFrame exceeds XLSX row limit (including header)")
+        dtypes = getattr(py_df, "dtypes", None)
+        formats = [_dtype_format(dtype) for dtype in dtypes] if dtypes is not None else [None] * len(columns)
+        if len(formats) != len(columns):
+            raise ValueError("DataFrame dtype count does not match its columns")
+        date_1904 = self._native.uses_1904_dates()
 
-        self.append_table_at(table, f"{letters.upper()}{start_row}")
-        if len(table) > 1:
-            for offset, fmt in enumerate(formats):
-                if fmt is not None:
-                    column = _column_name(start_column + offset)
-                    end_row = start_row + len(table) - 1
-                    self.set_number_format(f"{column}{start_row + 1}:{column}{end_row}", fmt)
+        def rows():
+            yield [(1, str(column)) for column in columns]
+            for offset, row in enumerate(py_df.iter_rows(), start=1):
+                if start_row + offset > _MAX_ROWS:
+                    raise ValueError("DataFrame exceeds XLSX row limit (including header)")
+                if len(row) != len(columns):
+                    raise ValueError("DataFrame row width does not match its columns")
+                values = []
+                for index, value in enumerate(row):
+                    cell, fmt = _excel_value(value, date_1904)
+                    values.append(cell)
+                    if dtypes is None and fmt is not None:
+                        formats[index] = fmt
+                yield values
+
+        self._native.write_typed_rows(f"{letters.upper()}{start_row}", rows())
+        if force_column_formats:
+            self._native.force_column_formats([(start_column + offset, fmt) for offset, fmt in enumerate(formats) if fmt is not None])
 
 
 class Scanner:

@@ -31,7 +31,8 @@ with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / "empty.xlsx"
     create_excel(path)
     editor = Scanner(path).open_editor()
-    editor.add_worksheet("Data").with_polars(Frame())
+    editor = editor.add_worksheet("Data")
+    editor.with_polars(Frame())
     editor.save(path)
     assert Scanner(path).get_sheets() == ["Sheet1", "Data"]
     assert isinstance(Editor.open(path), Editor)

@@ -1,5 +1,5 @@
-use std::env;
 use std::cell::RefCell;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -253,9 +253,11 @@ fn parse_cli() -> Result<Cli> {
     }
 
     let output_dir = output_dir.unwrap_or_else(|| {
-        root.join("test")
-            .join("perf_outputs")
-            .join(format!("{}-{}", config.preset_name, unix_timestamp()))
+        root.join("test").join("perf_outputs").join(format!(
+            "{}-{}",
+            config.preset_name,
+            unix_timestamp()
+        ))
     });
 
     Ok(Cli { config, output_dir })
@@ -270,7 +272,12 @@ fn parse_usize_arg(args: &[String], idx: usize, flag: &str) -> Result<usize> {
 
 fn bench_append_tail(test_dir: &Path, out_dir: &Path, cfg: &ScenarioConfig) -> Result<BenchResult> {
     println!("run append_tail");
-    let src = staged_copy(test_dir, out_dir, "test_new_ws.xlsx", "append_tail_input.xlsx")?;
+    let src = staged_copy(
+        test_dir,
+        out_dir,
+        "test_new_ws.xlsx",
+        "append_tail_input.xlsx",
+    )?;
     let dst = out_dir.join("append_tail_out.xlsx");
     run_bench("append_tail", &src, &dst, move |editor| {
         editor.append_table(GeneratedRows::new(cfg.append_rows, cfg.append_cols, 11))?;
@@ -305,11 +312,7 @@ fn bench_append_overlap(
     })
 }
 
-fn bench_style_storm(
-    test_dir: &Path,
-    out_dir: &Path,
-    cfg: &ScenarioConfig,
-) -> Result<BenchResult> {
+fn bench_style_storm(test_dir: &Path, out_dir: &Path, cfg: &ScenarioConfig) -> Result<BenchResult> {
     println!("prepare style_storm input");
     let src = out_dir.join("style_storm_input.xlsx");
     prepare_style_input(test_dir, &src, cfg)?;
@@ -624,7 +627,10 @@ fn bench_format_matrix(
         let started = Instant::now();
         for col in 0..cols.min(8) {
             let name = excel_col_name(col);
-            editor.set_number_format(&format!("{name}:"), col_formats[col as usize % col_formats.len()])?;
+            editor.set_number_format(
+                &format!("{name}:"),
+                col_formats[col as usize % col_formats.len()],
+            )?;
         }
         details_for_run.borrow_mut().push(BenchDetail {
             label: "full_cols",
@@ -644,7 +650,12 @@ fn bench_switch_storm(
     cfg: &ScenarioConfig,
 ) -> Result<BenchResult> {
     println!("run switch_storm");
-    let src = staged_copy(test_dir, out_dir, "test_new_ws.xlsx", "switch_storm_input.xlsx")?;
+    let src = staged_copy(
+        test_dir,
+        out_dir,
+        "test_new_ws.xlsx",
+        "switch_storm_input.xlsx",
+    )?;
     let dst = out_dir.join("switch_storm_out.xlsx");
     run_bench("switch_storm", &src, &dst, move |editor| {
         editor.add_worksheet("BenchA")?;
@@ -717,7 +728,12 @@ fn prepare_style_input(test_dir: &Path, dst: &Path, cfg: &ScenarioConfig) -> Res
     Ok(())
 }
 
-fn run_bench<F>(scenario: &'static str, src: &Path, dst: &Path, mut mutate: F) -> Result<BenchResult>
+fn run_bench<F>(
+    scenario: &'static str,
+    src: &Path,
+    dst: &Path,
+    mut mutate: F,
+) -> Result<BenchResult>
 where
     F: FnMut(&mut XlsxEditor) -> Result<()>,
 {
@@ -792,7 +808,11 @@ fn print_report(results: &[BenchResult], cfg: &ScenarioConfig) {
     }
 }
 
-fn write_markdown_report(out_dir: &Path, results: &[BenchResult], cfg: &ScenarioConfig) -> Result<()> {
+fn write_markdown_report(
+    out_dir: &Path,
+    results: &[BenchResult],
+    cfg: &ScenarioConfig,
+) -> Result<()> {
     let mut md = String::new();
     md.push_str("# excelsior stress benchmark\n\n");
     md.push_str("## Config\n\n");
@@ -830,7 +850,11 @@ fn write_markdown_report(out_dir: &Path, results: &[BenchResult], cfg: &Scenario
         }
         md.push_str(&format!("### {}\n\n", item.scenario));
         for detail in &item.details {
-            md.push_str(&format!("- {}: `{}` ms\n", detail.label, format_ms(detail.elapsed_ms)));
+            md.push_str(&format!(
+                "- {}: `{}` ms\n",
+                detail.label,
+                format_ms(detail.elapsed_ms)
+            ));
         }
         md.push('\n');
     }
