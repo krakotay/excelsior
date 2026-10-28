@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -11,42 +12,27 @@ from openpyxl import load_workbook
 
 
 def assert_with_libreoffice(path: Path) -> None:
-    path = Path(path)
-    profile_dir = Path(tempfile.mkdtemp(prefix="lo-profile-")).resolve()
-    profile_arg = f"-env:UserInstallation=file://{profile_dir}"
-    proc = subprocess.run(
-        [
-            "libreoffice",
-            "--headless",
-            "--nologo",
-            "--nodefault",
-            "--nolockcheck",
-            "--nofirststartwizard",
-            profile_arg,
-            "--convert-to",
-            "csv",
-            "--outdir",
-            str(path.parent),
-            str(path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    csv_out = path.with_suffix(".csv")
-    if proc.returncode == 0:
+    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    if executable is None:
+        # The openpyxl and ZIP assertions still run without an office install.
         return
-    if csv_out.exists():
-        # Some headless environments return non-zero with dconf/javaldx warnings.
-        return
-    if "dconf-CRITICAL" in proc.stderr or "failed to launch javaldx" in proc.stderr:
-        return
-    assert False, (
-        f"libreoffice failed with code {proc.returncode}\n"
-        f"stdout:\n{proc.stdout}\n"
-        f"stderr:\n{proc.stderr}"
-    )
+    path = Path(path).resolve()
+    with tempfile.TemporaryDirectory(prefix="excelsior-lo-") as directory:
+        root = Path(directory)
+        proc = subprocess.run(
+            [
+                executable,
+                "--headless", "--nologo", "--nodefault", "--nolockcheck",
+                "--nofirststartwizard",
+                f"-env:UserInstallation={(root / 'profile').as_uri()}",
+                "--convert-to", "csv", "--outdir", str(root), str(path),
+            ],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+        assert (root / path.with_suffix(".csv").name).exists(), (
+            f"LibreOffice produced no CSV (exit {proc.returncode})\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
 
 
 def get_sheet(path: Path, sheet_name: str):

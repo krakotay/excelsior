@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.9"]
+requires = ["maturin>=1.13,<2"]
 build-backend = "maturin"
 
 [project]
 name = "excelsior-fast"
 dynamic = ["version"]
-description = "Blazingly fast append to xlsx file"
+description = "Fast XLSX creation and editing with a Rust core"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -13,27 +13,31 @@ authors = [{ name = "Mihail Boreyko", email = "krakotay@yandex.ru" }]
 keywords = ["excel", "xlsx", "rust", "append"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: OS Independent",
 ]
 urls = { Homepage = "https://github.com/krakotay/excelsior", Issues = "https://github.com/krakotay/excelsior/issues" }
-dependencies = [
-    "numpy>=2.2.6",
-    "openpyxl>=3.1.5",
-    # "patchelf>=0.17.2.4",
-    "pip>=25.3",
-    "polars==1.35.*",
-    "pyarrow>=20",
-    "pytest>=9.0.2",
-]
+dependencies = []
+
+[project.optional-dependencies]
+polars = ["polars>=1.35"]
+test = ["openpyxl>=3.1.5", "pytest>=9", "polars>=1.35"]
 
 [tool.maturin]
 bindings = "pyo3"
-module-name = "excelsior"
+module-name = "excelsior.excelsior"
+python-source = "."
+exclude = ["excelsior/*.pdb"]
 include = [
     { path = "README.md", format = "sdist" },
     "excelsior/__init__.pyi",
     "excelsior/excelsior.pyi",
-    "excelsior/py.typed", # опционально
+    "excelsior/py.typed",
 ]

@@ -8,6 +8,19 @@ The core functionality resides in the `rust-core` crate. It exposes the
 `XlsxEditor` type which can open an existing `.xlsx` file and modify its
 contents.
 
+### Creating a workbook
+
+```rust
+use rust_core::{create_excel, XlsxEditor};
+
+create_excel("empty.xlsx", "Sheet1")?;
+let mut editor = XlsxEditor::create("new.xlsx", "Data")?;
+editor.append_row(["Hello", "42"])?;
+editor.save("new.xlsx")?;
+```
+
+Creation replaces an existing file and creates missing parent directories.
+
 ### Opening a sheet
 ```rust
 use rust_core::{XlsxEditor, scan};
@@ -45,7 +58,43 @@ Bindings are provided in the `python-bindings` crate. After building with
 `maturin`, the package `excelsior` offers an interface similar to the
 Rust API.
 
-Example:
+### Creating and writing
+
+```python
+from excelsior import create_excel, Editor
+
+create_excel("empty.xlsx", "Data")
+editor = Editor.create("new.xlsx", "Data")
+editor.append_row(["Hello", "42"])
+editor.save("new.xlsx")
+```
+
+`create_excel` is exported from the package root. `Editor.create` creates the
+workbook and opens its first sheet. Both accept strings or `pathlib.Path`.
+`Editor.open(path)` opens the first sheet by default, as does
+`Scanner(path).open_editor()`.
+
+### Polars
+
+```python
+import polars as pl
+from excelsior import Editor
+
+editor = Editor.create("data.xlsx")
+editor.add_worksheet("Data").with_polars(pl.DataFrame({"count": [1, 2]}), "B3")
+editor.save("data.xlsx")
+```
+
+The Python adapter only uses `columns` and `iter_rows()`. It has no compile-time
+Polars dependency, never calls `to_arrow`, and does not import Polars or
+PyArrow. Install your preferred Polars version or use the optional
+`excelsior-fast[polars]` extra. Empty frames with a schema write headers;
+frames without columns leave the sheet unchanged. Dates/datetimes are written
+as Excel serials with number formats; booleans remain `TRUE`/`FALSE` text.
+The adapter validates XLSX row/column limits before editing the sheet.
+
+### Existing workbooks
+
 ```python
 from excelsior import scan_excel, Editor
 

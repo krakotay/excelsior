@@ -7,7 +7,7 @@ name = "excelsior"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28.0", features = ["extension-module"] }
+pyo3 = { version = "0.30.0", features = ["extension-module"] }
 rust-core = { path = "../rust-core", default-features = true}
 zip.workspace = true
 anyhow.workspace = true

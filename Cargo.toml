@@ -5,10 +5,10 @@ members = ["rust-core", "python-bindings"]
 resolver = "3"
 
 [workspace.package]
-version  = "0.13.2"
+version  = "0.14.0"
 edition  = "2024"
 license  = "GPL-3.0"
 
 [workspace.dependencies]
-zip = { version = "7.4.0", default-features = false, features = ["deflate"] }
-anyhow = "1.0.100"
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+anyhow = "1.0.104"

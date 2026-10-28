@@ -1,10 +1,16 @@
-from importlib import import_module as _import_module
-from .excelsior import Scanner, Editor, AlignSpec, HorizAlignment, VertAlignment, scan_excel, create_excel
+"""Fast XLSX creation and editing. Polars is an optional Python integration."""
 
-_ext = _import_module(".excelsior", package=__name__)  # бинарник: excelsior.excelsior
+from .excelsior import (
+    AlignSpec,
+    HorizAlignment,
+    VertAlignment,
+    __version__,
+    create_excel,
+    scan_excel,
+)
+from ._editor import Editor, Scanner
 
-# ЯВНЫЕ реэкспорты — чтобы статике, IDE и людям было ясно
-
-__all__ = ["Scanner", "Editor", "AlignSpec", "HorizAlignment", "VertAlignment", "scan_excel", "create_excel"]
-
-del _import_module, _ext
+__all__ = [
+    "Scanner", "Editor", "AlignSpec", "HorizAlignment", "VertAlignment",
+    "scan_excel", "create_excel", "__version__",
+]

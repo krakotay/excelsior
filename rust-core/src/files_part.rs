@@ -263,13 +263,13 @@ impl XlsxEditor {
         let mut zin = zip_crate::ZipArchive::new(File::open(&self.src_path)?)?;
         let mut zout = zip_crate::ZipWriter::new(File::create(dst)?);
 
-        let deflated: zip_crate::write::FileOptions<'_, ()> =
-            zip_crate::write::FileOptions::default()
+        let deflated: zip_crate::write::SimpleFileOptions =
+            zip_crate::write::SimpleFileOptions::default()
                 .compression_method(zip_crate::CompressionMethod::Deflated)
                 .compression_level(Some(1));
 
-        let stored: zip_crate::write::FileOptions<'_, ()> =
-            zip_crate::write::FileOptions::default()
+        let stored: zip_crate::write::SimpleFileOptions =
+            zip_crate::write::SimpleFileOptions::default()
                 .compression_method(zip_crate::CompressionMethod::Stored);
 
         use std::collections::HashSet;
@@ -308,7 +308,7 @@ impl XlsxEditor {
         }
 
         for i in 0..zin.len() {
-            let name = { zin.by_index_raw(i)?.name().to_string() };
+            let name = { zin.by_index_raw(i)?.name()?.into_owned() };
             // НОВОЕ: пропускаем удалённые файлы
             if self.removed_files.contains(&name) {
                 continue;
@@ -536,7 +536,7 @@ impl XlsxEditor {
         // -------- 2) найти свободный sheet#.xml ----------
         let mut max_sheet_file = 0usize;
         for i in 0..zin.len() {
-            let name = zin.by_index(i)?.name().to_owned();
+            let name = zin.by_index(i)?.name()?.into_owned();
             if let Some(n) = name
                 .strip_prefix("xl/worksheets/sheet")
                 .and_then(|s| s.strip_suffix(".xml"))
@@ -581,7 +581,7 @@ impl XlsxEditor {
                     // Target пути тут нет — он в rels, так что просто пустим.
                     for a in e.attributes().with_checks(false).flatten() {
                         let k = a.key.as_ref();
-                        let v = String::from_utf8_lossy(&a.value).into_owned();
+                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
                         if k == b"name" {
                             name = Some(v.clone());
                         }
@@ -707,7 +707,7 @@ impl XlsxEditor {
 
                     for a in e.attributes().with_checks(false).flatten() {
                         let k = a.key.as_ref();
-                        let v = String::from_utf8_lossy(&a.value).into_owned();
+                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
                         if k == b"name" {
                             name = Some(v.clone());
                         }
@@ -746,7 +746,7 @@ impl XlsxEditor {
 
                     for a in e.attributes().with_checks(false).flatten() {
                         let k = a.key.as_ref();
-                        let v = String::from_utf8_lossy(&a.value).into_owned();
+                        let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
                         if k == b"Id" {
                             id = Some(v.clone());
                         }
@@ -998,7 +998,7 @@ fn get_sheet_rid_by_name(wb_xml: &[u8], target_name: &str) -> Option<String> {
                 let mut rid = None;
                 for a in e.attributes().with_checks(false).flatten() {
                     let k = a.key.as_ref();
-                    let v = String::from_utf8_lossy(&a.value).into_owned();
+                    let v = a.decode_and_unescape_value(rdr.decoder()).ok()?.into_owned();
                     if k == b"name" {
                         name = Some(v.clone());
                     }
@@ -1083,7 +1083,7 @@ fn parse_sheets_inner(wb_xml: &[u8]) -> anyhow::Result<(usize, usize, Vec<SheetT
                 let mut sid = None;
                 for a in e.attributes().with_checks(false).flatten() {
                     let k = a.key.as_ref();
-                    let v = String::from_utf8_lossy(&a.value).into_owned();
+                    let v = a.decode_and_unescape_value(rdr.decoder())?.into_owned();
                     if k == b"name" {
                         name = Some(v.clone());
                     } else if k == b"r:id" {

@@ -1,63 +1,37 @@
 name: Build maturin wheels
-permissions:
-  contents: write
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.1.2)'
+        description: 'Release version matching Cargo.toml (e.g. 0.14.0)'
         required: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
-        os: [ubuntu-latest, windows-latest]
+    uses: ./.github/workflows/wheels.yml
+    with:
+      expected-version: ${{ inputs.version }}
 
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build wheels
-        run: |
-          maturin build --release -m python-bindings/Cargo.toml --interpreter python${{ matrix.python-version }}
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}-python${{ matrix.python-version }}
-          path: target/wheels/*.whl
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: dist  # всё в папку dist/
-
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
           name: Release v${{ inputs.version }}
-          files: dist/**/*.whl
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                
+          fail_on_unmatched_files: true
+          files: dist/*

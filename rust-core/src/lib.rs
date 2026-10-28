@@ -3,6 +3,8 @@
 // #[global_allocator]
 // static GLOBAL: MiMalloc = MiMalloc;
 pub mod files_part;
+pub mod workbook;
+pub use workbook::create_excel;
 use memchr::memmem;
 mod read_part;
 pub mod style;
@@ -88,6 +90,13 @@ pub struct XlsxEditor {
 
 /// Main
 impl XlsxEditor {
+    /// Creates an empty workbook on disk and opens its first sheet for editing.
+    /// An existing destination is replaced, just as with `create_excel`.
+    pub fn create<P: AsRef<Path>>(path: P, sheet_name: &str) -> Result<Self> {
+        create_excel(&path, sheet_name)?;
+        Self::open(path, &workbook::normalize_sheet_name(sheet_name)?)
+    }
+
     /// Opens an XLSX file and prepares a specific sheet for editing by its name.
     ///
     /// This function first scans the workbook to find the sheet ID corresponding to the given sheet name,
@@ -730,11 +739,10 @@ pub fn scan<P: AsRef<Path>>(src: P) -> Result<Vec<String>> {
     while let Ok(ev) = reader.read_event() {
         match ev {
             Event::Empty(ref e) | Event::Start(ref e) if e.name().as_ref() == b"sheet" => {
-                if let Some(n) = e.attributes().with_checks(false).flatten().find_map(|a| {
-                    (a.key.as_ref() == b"name")
-                        .then(|| String::from_utf8_lossy(&a.value).into_owned())
-                }) {
-                    names.push(n);
+                if let Some(attribute) = e.attributes().with_checks(false).flatten()
+                    .find(|a| a.key.as_ref() == b"name")
+                {
+                    names.push(attribute.decode_and_unescape_value(reader.decoder())?.into_owned());
                 }
             }
             Event::Eof => break,

@@ -5,10 +5,14 @@ on:
     branches: [ "master" ]
     paths:
       - 'rust-core/**'
+      - 'Cargo.*'
+      - '.github/workflows/rust.yml'
   pull_request:
     branches: [ "master" ]
     paths:
       - 'rust-core/**'
+      - 'Cargo.*'
+      - '.github/workflows/rust.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,7 +24,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked -p rust-core --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked -p rust-core --verbose

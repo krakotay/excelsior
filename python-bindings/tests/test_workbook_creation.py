@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 
 from excelsior import Editor, Scanner, create_excel
 
@@ -47,3 +48,48 @@ def test_editor_open_first_sheet_when_not_specified(tmp_path: Path) -> None:
 
     ws = get_sheet(out, "SheetA")
     assert cell_text(ws["A1"].value) == "ok"
+
+
+def test_create_relative_filename_in_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    editor = Editor.create("new.xlsx")
+    editor.append_row(["hello", "42"])
+    editor.save("new.xlsx")
+    ws = get_sheet(tmp_path / "new.xlsx", "Sheet1")
+    assert ws["A1"].value == "hello"
+    assert ws["B1"].value == 42
+
+
+@pytest.mark.parametrize("name", ["Я" * 31, "Data & <values> \"2026\""])
+def test_create_nested_path_with_unicode_and_escaped_sheet_names(tmp_path, name):
+    path = tmp_path / "nested" / "new.xlsx"
+    create_excel(path, name)
+    assert Scanner(path).get_sheets() == [name]
+    assert get_sheet(path, name)["A1"].value is None
+
+
+@pytest.mark.parametrize("name", ["", "x" * 32, "bad/name", "'quoted", "quoted'", "bad\x00name"])
+def test_invalid_sheet_name_preserves_existing_file(tmp_path, name):
+    path = tmp_path / "existing.xlsx"
+    path.write_bytes(b"keep")
+    with pytest.raises(RuntimeError):
+        create_excel(path, name)
+    assert path.read_bytes() == b"keep"
+
+
+def test_escaped_names_can_be_opened_switched_and_renamed(tmp_path):
+    path = tmp_path / "escaped.xlsx"
+    name = 'Data & "values"'
+    renamed = "Renamed & values"
+    editor = Editor.create(path, name)
+    editor.set_cell("A1", "original")
+    editor.add_worksheet("Other")
+    editor.with_worksheet(name)
+    editor.rename_worksheet(name, renamed)
+    editor.save(path)
+    assert Scanner(path).get_sheets() == [renamed, "Other"]
+    editor = Editor.open(path, renamed)
+    editor.set_cell("B1", "reopened")
+    editor.save(path)
+    assert get_sheet(path, renamed)["A1"].value == "original"
+    assert get_sheet(path, renamed)["B1"].value == "reopened"
