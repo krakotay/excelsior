@@ -252,58 +252,87 @@ Local before/after measurements and remaining performance limits are recorded
 in [docs/performance-015.md](https://github.com/krakotay/excelsior/blob/master/docs/performance-015.md).
 
 
-## Parallel exports and ZIP compression (0.15.1)
+## Native parallel exports (0.15.2)
 
-Independent workbooks can be written from Python threads. The adapter selects
-value converters once per dataframe dtype and hands bounded batches to Rust;
-XML generation, row spooling, float formatting, and saving run outside the GIL.
-Python iteration/conversion still uses the GIL, so scaling is workload-dependent.
-The package still imports neither Polars nor Arrow.
-
-```python
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from excelsior import WorkbookWriter
-
-MAX_ROWS = 1_000_000
-output = Path("out")
-
-def export(item):
-    name, frame = item
-    with WorkbookWriter(output / f"{name}.xlsx", "Index",
-                        compression_level=1, compression_threads=2) as wb:
-        for i, offset in enumerate(range(0, max(1, frame.height), MAX_ROWS), 1):
-            if i > 1:
-                wb.add_worksheet(f"Sheet{i}")
-            wb.with_polars(frame.slice(offset, MAX_ROWS))
-
-with ThreadPoolExecutor(max_workers=4) as pool:
-    list(pool.map(export, files_list))
-```
-
-Each worker owns its workbook; dataframes are only read. WorkbookWriter keeps
-worksheet XML out of RAM, which is useful when several large files are written
-at once. No multiprocessing/pickling or additional dataframe copies are needed.
-Its compression workers can close previous sheets while subsequent rows are
-spooled. Exceptions from `pool.map` propagate to the caller.
-
-Editor can also be used in the worker, retaining its normal mutation contracts:
+Use one `multithreading.WorkbookPool` for independent files. Rust owns the
+bounded job queue and file worker threads. Dataframe iteration uses the Python
+adapter; XML generation, row spooling, numeric serialization and ZIP compression
+run in Rust outside the GIL. No Python executor, processes, pickling or mandatory
+Polars/Arrow dependency is involved.
 
 ```python
-wb = Editor.create("out/report.xlsx", "Index")
-# wb.with_polars(...); wb = wb.add_worksheet(...)
-wb.save(compression_level=1, compression_threads=4)
+from excelsior import multithreading as mt
+
+with mt.WorkbookPool(workers=4, compression_level=1,
+                     compression_threads=8) as pool:
+    for name, df in files_list:
+        pool.write_polars(f"out/{name}.xlsx", df, max_rows=1_000_000)
+
+print("Done")  # all files have finished; export failures raise before this line
 ```
 
-`compression_threads` must be positive and defaults to 1. Each worksheet is a
-separate ZIP member, so several sheets can compress concurrently. One member's
-Deflate stream is not split across threads; a one-sheet workbook generally
-benefits from exporting independent files in parallel instead. Combining many
-file workers and compression workers does not guarantee extra speed.
-Parallel compression uses a bounded queue and temporary files beside the output,
-without buffering full compressed worksheets in RAM. Atomic replacement and
-cleanup on success/error/abort apply to both sequential and parallel modes.
+`write_polars` splits a dataframe into sheets, repeats headers and writes an
+empty dataframe's headers too. `max_rows` counts data rows, with a maximum of
+1,048,575 to leave one header row. Pass `sheet_name="Index"` to name the first
+sheet; later sheets are `Sheet2`, `Sheet3`, etc., skipping name collisions.
+It returns an `ExportTask`: `task.result()` waits and returns the absolute output
+path, `task.done()` checks completion, and `task.cancel()` cancels a queued job
+only. Running exports finish normally. `force_column_formats=False` disables
+whole-column dtype formats without changing typed cell storage.
 
-`Editor.create` is a classmethod: calling `origin.create(...)` creates a new
-book rather than copying `origin` or inheriting its sheet name. Pass `"Index"`
-explicitly as shown above; a separate blank.xlsx is unnecessary for this export.
+For more control, keep the usual workbook syntax with a shared pool:
+
+```python
+with mt.WorkbookPool(workers=4) as pool:
+    for name, df in files_list:
+        with mt.WorkbookWriter(f"out/{name}.xlsx", "Sheet1", pool=pool,
+                               compression_level=1, compression_threads=8) as wb:
+            for i, offset in enumerate(range(0, max(1, df.height), MAX_ROWS), 1):
+                if i > 1:
+                    wb.add_worksheet(f"Sheet{i}")
+                wb.with_polars(df.slice(offset, MAX_ROWS))
+```
+
+`pool.workbook(path, ...)` is shorthand for the shared-pool writer and inherits
+its compression defaults. The inner context records writes and submits one file;
+the outer context joins every file before returning or raising the first export
+exception in submission order. `wb.wait()` waits for just that book. Standalone
+`with mt.WorkbookWriter(path, ...)` owns one worker and waits at its own exit;
+use a shared pool to overlap files. Mutators return `None` and modify the recorded
+book. `save()`/`close()` submit once; `save(other_path)` submits under another
+name and preserves the original. Submitted iterators cannot be replayed to
+another destination. Repeated `save()` is harmless.
+
+Commands and dataframe iterators are consumed in background workers **after
+submission**. Keep their inputs unchanged until completion. At most `workers`
+books run and `workers` more wait in the native queue; submission blocks when
+that queue is full, releasing the GIL so workers can progress. Duplicate output
+paths are rejected within a pool. Do not call submit/wait/close on a pool from
+one of its own row iterators; this raises instead of deadlocking. Close pools
+explicitly, normally with `with`.
+
+Original exception types and tracebacks propagate from workers. Each file is
+saved atomically; a failed file preserves any existing destination. Successful
+files remain even if another job fails. If the outer body raises, queued jobs
+are cancelled, active jobs are joined, and the body's exception is preserved.
+Each active writer uses disk spooling and bounded native row batches, while
+the supplied dataframes remain owned by the caller. Recorded commands stay in
+memory until submission; for large row-wise exports use `write_rows(iterator)`
+in one command to keep the recording small. Python conversion
+still requires the GIL, so more workers do not guarantee more speed.
+
+## Parallel ZIP compression (0.15.1)
+
+`compression_threads` is supported by `Editor.save` and both WorkbookWriter
+variants. It defaults to 1. Independent sheets/ZIP members compress concurrently
+using temporary files; one member's Deflate stream is not split across threads.
+A one-sheet workbook generally benefits from exporting separate files in
+parallel. Combining many file and compression workers can oversubscribe CPUs;
+compare 2 and 8 compression threads for your workload. Atomic saving and cleanup
+apply on success, error and abort.
+
+The regular `WorkbookWriter` and `Editor` also remain usable from a Python
+`ThreadPoolExecutor` if the application already owns one. Each thread must own
+its writer. `Editor.create` is a classmethod: `origin.create(...)` creates a new
+book rather than copying `origin` or inheriting its sheet name; specify it
+explicitly. A separate blank.xlsx is unnecessary for export.

@@ -56,7 +56,7 @@ p.add_argument("--csv", type=Path, required=True)
 p.add_argument("--work-dir", type=Path, default=Path(tempfile.gettempdir()))
 p.add_argument("--result", type=Path)
 p.add_argument("--rows", type=int, default=200_000)
-p.add_argument("--mode", choices=["editor", "stream"], default="editor")
+p.add_argument("--mode", choices=["editor", "stream", "native"], default="editor")
 p.add_argument("--workers", type=int, default=1)
 p.add_argument("--compression-threads", type=int, default=1)
 p.add_argument("--sheet-rows", type=int, default=1_000_000)
@@ -172,7 +172,36 @@ def export(item, directory):
 with tempfile.TemporaryDirectory(prefix="osv-", dir=root) as directory:
     before = resource.getrusage(resource.RUSAGE_SELF)
     begin = time.perf_counter()
-    if a.workers == 1:
+    if a.mode == "native":
+        from excelsior.multithreading import WorkbookPool
+
+        with WorkbookPool(
+            a.workers, compression_level=1, compression_threads=a.compression_threads
+        ) as pool:
+            tasks = [
+                (
+                    pool.write_polars(
+                        Path(directory) / f"{name}.xlsx", df, max_rows=a.sheet_rows
+                    ),
+                    name,
+                    df,
+                )
+                for name, df in jobs
+            ]
+        exported = [
+            (
+                {
+                    "name": name,
+                    "rows": df.height,
+                    "cols": df.width,
+                    "bytes": task.path.stat().st_size,
+                },
+                task.result(),
+                df,
+            )
+            for task, name, df in tasks
+        ]
+    elif a.workers == 1:
         exported = [export(job, directory) for job in jobs]
     else:
         with ThreadPoolExecutor(max_workers=a.workers) as pool:

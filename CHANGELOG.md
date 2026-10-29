@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.2
+
+- Add `excelsior.multithreading.WorkbookPool` with bounded native Rust file
+  workers, queue backpressure outside the GIL, and automatic joining on exit.
+- Add a deferred `multithreading.WorkbookWriter` with familiar mutators/context
+  syntax; a shared pool overlaps files, a standalone writer waits on exit.
+- Add `pool.write_polars` to split large/empty dataframes into typed sheets with
+  headers, plus per-file tasks for waiting, completion checks and queued-job
+  cancellation. Polars stays an optional Python-only integration.
+- Preserve original worker exceptions and existing output files on failure;
+  reject duplicate destinations and waits/submissions from a pool's own worker.
+- Keep compression level/thread settings configurable per pool or file.
+- Trace task exceptions through Python cyclic GC so failed jobs do not retain
+  dataframes through iterator/traceback cycles.
+
 ## 0.15.1
 
 - Convert dataframe values with converters selected once per dtype; pass finite

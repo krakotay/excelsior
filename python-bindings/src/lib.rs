@@ -1,3 +1,4 @@
+mod pool;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyTuple};
@@ -613,6 +614,8 @@ fn excelsior(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Editor>()?;
     m.add_class::<WorkbookWriter>()?;
+    m.add_class::<pool::WorkbookPool>()?;
+    m.add_class::<pool::ExportTask>()?;
     m.add_class::<Scanner>()?;
     m.add_function(wrap_pyfunction!(scan_excel, m)?)?;
     m.add_function(wrap_pyfunction!(create_excel, m)?)?;

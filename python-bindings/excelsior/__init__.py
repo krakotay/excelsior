@@ -10,11 +10,13 @@ from .excelsior import (
 )
 from ._editor import Editor, Scanner
 from ._writer import WorkbookWriter
+from . import multithreading
 
 __all__ = [
     "Scanner",
     "Editor",
     "WorkbookWriter",
+    "multithreading",
     "AlignSpec",
     "HorizAlignment",
     "VertAlignment",

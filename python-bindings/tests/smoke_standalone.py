@@ -21,7 +21,14 @@ class BlockOptionalDependencies(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockOptionalDependencies())
 
-from excelsior import Editor, Scanner, WorkbookWriter, __version__, create_excel
+from excelsior import (
+    Editor,
+    Scanner,
+    WorkbookWriter,
+    __version__,
+    create_excel,
+    multithreading,
+)
 
 
 class Frame:
@@ -55,4 +62,13 @@ with tempfile.TemporaryDirectory() as directory:
     with zipfile.ZipFile(streaming) as archive:
         assert archive.testzip() is None
         assert b"00123" in archive.read("xl/worksheets/sheet2.xml")
+    with multithreading.WorkbookPool(2) as pool:
+        for index in range(4):
+            with pool.workbook(Path(directory) / f"native-{index}.xlsx") as writer:
+                writer.with_polars(Frame())
+                writer.write_rows([["00123", index]])
+    for index in range(4):
+        with zipfile.ZipFile(Path(directory) / f"native-{index}.xlsx") as archive:
+            assert archive.testzip() is None
+            assert b"00123" in archive.read("xl/worksheets/sheet1.xml")
 print(f"Standalone package {__version__}: OK")

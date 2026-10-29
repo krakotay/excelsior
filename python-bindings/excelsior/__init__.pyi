@@ -11,3 +11,5 @@ from ._editor import Editor as Editor, Scanner as Scanner
 from ._writer import WorkbookWriter as WorkbookWriter
 
 __version__: str
+
+from . import multithreading as multithreading

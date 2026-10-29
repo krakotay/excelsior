@@ -94,7 +94,7 @@ jobs:
         run: >-
           python -m pip install --no-deps --no-build-isolation ./python-bindings
       - name: Test Python Polars adapter
-        run: python -m pytest python-bindings/tests/test_polars_types.py python-bindings/tests/test_015_regressions.py python-bindings/tests/test_streaming_cow_xml.py python-bindings/tests/test_0151_parallel.py -q
+        run: python -m pytest python-bindings/tests/test_polars_types.py python-bindings/tests/test_015_regressions.py python-bindings/tests/test_streaming_cow_xml.py python-bindings/tests/test_0151_parallel.py python-bindings/tests/test_0152_pool.py -q
 
   sdist:
     needs: version
