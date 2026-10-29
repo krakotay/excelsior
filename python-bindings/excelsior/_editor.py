@@ -175,9 +175,9 @@ class Editor:
     def last_rows_index(self, col_name: str) -> list[int]:
         return self._native.last_rows_index(col_name)
 
-    def save(self, path: str | PathLike[str] | None = None) -> None:
+    def save(self, path: str | PathLike[str] | None = None, *, compression_level: int = 3) -> None:
         """Save to the original path, or write a copy without changing that path."""
-        self._native.save(path)
+        self._native.save(path, compression_level=compression_level)
 
     def with_polars(self, py_df: Any, start_cell: str | None = None, *, force_column_formats: bool = True) -> None:
         """Mutate this worksheet with typed headers/rows from a dataframe.
@@ -187,50 +187,74 @@ class Editor:
         template formats. String values remain text in either mode. NaN/inf are
         written as text. No Polars import or Arrow conversion is performed.
         """
-        start = "A1" if start_cell is None else start_cell
-        match = re.fullmatch(r"([A-Za-z]+)([1-9][0-9]*)", start)
-        if match is None:
-            raise ValueError(f"Invalid Excel start cell: {start!r}")
-        letters, row_text = match.groups()
-        start_column = 0
-        for letter in letters.upper():
-            start_column = start_column * 26 + ord(letter) - 64
-        start_column -= 1
-        start_row = int(row_text)
-        if start_column >= _MAX_COLUMNS or start_row > _MAX_ROWS:
-            raise ValueError("Start cell exceeds XLSX worksheet limits")
-        columns = list(py_df.columns)
-        if not columns:
+        frame = _prepare_frame(py_df, start_cell, self._native.uses_1904_dates())
+        if frame is None:
             return
-        if start_column + len(columns) > _MAX_COLUMNS:
-            raise ValueError("DataFrame exceeds XLSX column limit")
-        height = getattr(py_df, "height", None)
-        if height is not None and start_row + height > _MAX_ROWS:
-            raise ValueError("DataFrame exceeds XLSX row limit (including header)")
-        dtypes = getattr(py_df, "dtypes", None)
-        formats = [_dtype_format(dtype) for dtype in dtypes] if dtypes is not None else [None] * len(columns)
-        if len(formats) != len(columns):
-            raise ValueError("DataFrame dtype count does not match its columns")
-        date_1904 = self._native.uses_1904_dates()
+        start, formats, rows = frame
+        column = _start_column(start)
+        if force_column_formats and getattr(py_df, "dtypes", None) is not None and self._native.is_empty_sheet():
+            # Empty sheets need no cell rewrite: establish column defaults first,
+            # then the native row writer assigns those styles as it writes cells.
+            draft = self._native.clone()
+            draft.force_column_formats([(column + i, fmt) for i, fmt in enumerate(formats) if fmt is not None])
+            draft.write_typed_rows(start, rows)
+            self._native = draft
+        else:
+            self._native.write_typed_rows(start, rows)
+            if force_column_formats:
+                self._native.force_column_formats([(column + i, fmt) for i, fmt in enumerate(formats) if fmt is not None])
 
-        def rows():
-            yield [(1, str(column)) for column in columns]
-            for offset, row in enumerate(py_df.iter_rows(), start=1):
-                if start_row + offset > _MAX_ROWS:
-                    raise ValueError("DataFrame exceeds XLSX row limit (including header)")
-                if len(row) != len(columns):
-                    raise ValueError("DataFrame row width does not match its columns")
-                values = []
-                for index, value in enumerate(row):
-                    cell, fmt = _excel_value(value, date_1904)
-                    values.append(cell)
-                    if dtypes is None and fmt is not None:
-                        formats[index] = fmt
-                yield values
 
-        self._native.write_typed_rows(f"{letters.upper()}{start_row}", rows())
-        if force_column_formats:
-            self._native.force_column_formats([(start_column + offset, fmt) for offset, fmt in enumerate(formats) if fmt is not None])
+
+def _start_column(start: str) -> int:
+    column = 0
+    for letter in re.match(r"[A-Z]+", start).group():
+        column = column * 26 + ord(letter) - 64
+    return column - 1
+
+
+def _prepare_frame(py_df: Any, start_cell: str | None, date_1904: bool):
+    start = "A1" if start_cell is None else start_cell
+    match = re.fullmatch(r"([A-Za-z]+)([1-9][0-9]*)", start)
+    if match is None:
+        raise ValueError(f"Invalid Excel start cell: {start!r}")
+    letters, row_text = match.groups()
+    start_column = 0
+    for letter in letters.upper():
+        start_column = start_column * 26 + ord(letter) - 64
+    start_column -= 1
+    start_row = int(row_text)
+    if start_column >= _MAX_COLUMNS or start_row > _MAX_ROWS:
+        raise ValueError("Start cell exceeds XLSX worksheet limits")
+    columns = list(py_df.columns)
+    if not columns:
+        return None
+    if start_column + len(columns) > _MAX_COLUMNS:
+        raise ValueError("DataFrame exceeds XLSX column limit")
+    height = getattr(py_df, "height", None)
+    if height is not None and start_row + height > _MAX_ROWS:
+        raise ValueError("DataFrame exceeds XLSX row limit (including header)")
+    dtypes = getattr(py_df, "dtypes", None)
+    formats = [_dtype_format(dtype) for dtype in dtypes] if dtypes is not None else [None] * len(columns)
+    if len(formats) != len(columns):
+        raise ValueError("DataFrame dtype count does not match its columns")
+
+    def rows():
+        yield [(1, str(column)) for column in columns]
+        for offset, row in enumerate(py_df.iter_rows(), start=1):
+            if start_row + offset > _MAX_ROWS:
+                raise ValueError("DataFrame exceeds XLSX row limit (including header)")
+            if len(row) != len(columns):
+                raise ValueError("DataFrame row width does not match its columns")
+            values = []
+            for index, value in enumerate(row):
+                cell, fmt = _excel_value(value, date_1904)
+                values.append(cell)
+                if dtypes is None and fmt is not None:
+                    formats[index] = fmt
+            yield values
+
+    return f"{letters.upper()}{start_row}", formats, rows()
 
 
 class Scanner:

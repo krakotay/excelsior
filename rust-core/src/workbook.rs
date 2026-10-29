@@ -55,10 +55,7 @@ pub fn create_excel<P: AsRef<Path>>(path: P, sheet_name: &str) -> Result<()> {
   <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
 </Types>"#;
 
-    let rels_root = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>"#;
+    let rels_root = ROOT_RELS;
 
     let workbook = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -82,7 +79,36 @@ pub fn create_excel<P: AsRef<Path>>(path: P, sheet_name: &str) -> Result<()> {
   <sheetData></sheetData>
 </worksheet>"#;
 
-    let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    let styles = BASE_STYLES;
+
+    zip.start_file("[Content_Types].xml", options)?;
+    std::io::Write::write_all(&mut zip, content_types.as_bytes())?;
+
+    zip.start_file("_rels/.rels", options)?;
+    std::io::Write::write_all(&mut zip, rels_root.as_bytes())?;
+
+    zip.start_file("xl/workbook.xml", options)?;
+    std::io::Write::write_all(&mut zip, workbook.as_bytes())?;
+
+    zip.start_file("xl/_rels/workbook.xml.rels", options)?;
+    std::io::Write::write_all(&mut zip, workbook_rels.as_bytes())?;
+
+    zip.start_file("xl/worksheets/sheet1.xml", options)?;
+    std::io::Write::write_all(&mut zip, sheet1.as_bytes())?;
+
+    zip.start_file("xl/styles.xml", options)?;
+    std::io::Write::write_all(&mut zip, styles.as_bytes())?;
+
+    zip.finish()?;
+    Ok(())
+}
+
+pub(crate) const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
+pub(crate) const BASE_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <fonts count="1">
     <font>
@@ -111,28 +137,6 @@ pub fn create_excel<P: AsRef<Path>>(path: P, sheet_name: &str) -> Result<()> {
     <cellStyle name="Normal" xfId="0" builtinId="0"/>
   </cellStyles>
 </styleSheet>"#;
-
-    zip.start_file("[Content_Types].xml", options)?;
-    std::io::Write::write_all(&mut zip, content_types.as_bytes())?;
-
-    zip.start_file("_rels/.rels", options)?;
-    std::io::Write::write_all(&mut zip, rels_root.as_bytes())?;
-
-    zip.start_file("xl/workbook.xml", options)?;
-    std::io::Write::write_all(&mut zip, workbook.as_bytes())?;
-
-    zip.start_file("xl/_rels/workbook.xml.rels", options)?;
-    std::io::Write::write_all(&mut zip, workbook_rels.as_bytes())?;
-
-    zip.start_file("xl/worksheets/sheet1.xml", options)?;
-    std::io::Write::write_all(&mut zip, sheet1.as_bytes())?;
-
-    zip.start_file("xl/styles.xml", options)?;
-    std::io::Write::write_all(&mut zip, styles.as_bytes())?;
-
-    zip.finish()?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

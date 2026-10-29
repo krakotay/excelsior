@@ -14,7 +14,7 @@ class BlockOptionalDependencies(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockOptionalDependencies())
 
-from excelsior import Editor, Scanner, __version__, create_excel
+from excelsior import Editor, Scanner, WorkbookWriter, __version__, create_excel
 
 
 class Frame:
@@ -39,4 +39,13 @@ with tempfile.TemporaryDirectory() as directory:
     with zipfile.ZipFile(path) as archive:
         assert archive.testzip() is None
         assert b"standalone" in archive.read("xl/worksheets/sheet2.xml")
+    streaming = Path(directory) / "streaming.xlsx"
+    with WorkbookWriter(streaming, compression_level=3) as writer:
+        writer.with_polars(Frame())
+        writer.add_worksheet("Second")
+        writer.write_rows((["00123", n] for n in range(3)))
+    assert Scanner(streaming).get_sheets() == ["Sheet1", "Second"]
+    with zipfile.ZipFile(streaming) as archive:
+        assert archive.testzip() is None
+        assert b"00123" in archive.read("xl/worksheets/sheet2.xml")
 print(f"Standalone package {__version__}: OK")

@@ -301,9 +301,8 @@ def test_failed_save_preserves_existing_output(tmp_path):
     output = tmp_path / "precious.xlsx"
     editor = Editor.create(source)
     output.write_bytes(b"preserve existing output")
-    source.unlink()  # force an archive-read failure during saving
     with pytest.raises(RuntimeError):
-        editor.save(output)
+        editor.save(output / "child.xlsx")  # parent is a file, so output creation fails
     assert output.read_bytes() == b"preserve existing output"
     assert not list(tmp_path.glob(".excelsior-save-*"))
 

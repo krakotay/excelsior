@@ -121,7 +121,7 @@ branch = editor.with_worksheet("Sheet1")  # editor still selects Data
 
 This applies to worksheet operations, styling, merges, column widths,
 `remove_style`, and `copy`. Ignoring their return value leaves the input
-unchanged. Copying a large workbook costs memory proportional to its edited XML.
+unchanged. Snapshots share XML and metadata through Arc; writing detaches the affected component.
 Rust methods explicitly taking `&mut self` retain Rust's mutating contract.
 
 Methods returning `None` modify the current editor: `set_cell`, `append_row`,
@@ -178,3 +178,58 @@ editor.save()
 Saving after every sheet rewrites the entire ZIP each time. Save once after the
 loop unless intermediate on-disk checkpoints are needed. Both `save()` and
 `save(path)` replace the destination atomically using a temporary file beside it.
+
+## Streaming creation with bounded memory (0.15)
+
+Use `WorkbookWriter` for new files whose rows only move forward. It spools the
+current sheet as typed records on disk and writes each closed sheet directly
+into ZIP. Worksheet XML is not retained in memory. Temporary disk space is
+required; the destination is replaced atomically when saving succeeds.
+
+```python
+from excelsior import WorkbookWriter
+
+with WorkbookWriter("out/report.xlsx", "Sheet1", compression_level=3) as wb:
+    for i, offset in enumerate(range(0, df.height, 1_000_000), start=1):
+        if i > 1:
+            wb.add_worksheet(f"Sheet{i}")  # mutates, returns None
+        wb.with_polars(df.slice(offset, 1_000_000))
+```
+
+All writer operations mutate and return `None`; factories return a new writer.
+The context manager saves on successful exit and discards temporary files on
+an exception. `save()`/`close()` finalizes the writer; subsequent writes are
+rejected. Repeated `save(other_path)` copies the completed archive without
+changing the original destination. Closed sheets cannot be revisited, edited,
+renamed, or copied; use `Editor` for templates, random edits, or snapshots.
+
+`with_polars` appends headers and rows after the previous rows by default.
+Explicit start cells must follow previous rows. Column formats and widths can
+be set on the active sheet before it closes. `force_column_formats=False`
+preserves its configured formats. Python-only adaptation is shared with Editor;
+Polars and Arrow are not imported by the package.
+
+`write_rows(iterator)` and `append_row(values)` preserve Python value types:
+strings remain text, including numeric-looking identifiers and formula-looking
+strings. `set_number_format("A:C", "0.00")` and
+`set_column_width("A:C", 24)` affect the current sheet's entire columns.
+A failing row iterator rolls back that write call; earlier rows remain usable.
+
+## ZIP compression
+
+```python
+editor.save()                       # compression_level=3 by default
+editor.save(compression_level=0)    # store every ZIP part without compression
+editor.save("copy.xlsx", compression_level=9)
+```
+
+Levels are `0..9`; invalid levels fail before changing the destination.
+Every ZIP part uses the requested level, including unchanged parts of a template;
+the former small-XML threshold is removed. Compression may change file size and
+saving time. On `WorkbookWriter` choose the level in its constructor, because
+worksheets are compressed before the final `save()` call.
+
+Editor snapshots share their XML buffers, caches, dimension metadata, and the
+original open ZIP source. Each branch has an independent ZIP cursor. Atomic
+saving by one branch does not replace the source read by the other branches.
+An open editor can still save if its original path has been removed.

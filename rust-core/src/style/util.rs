@@ -14,17 +14,11 @@ pub fn col_letter(mut n: u32) -> String {
 }
 
 pub fn col_index(s: &str) -> usize {
-    s.bytes().fold(0, |acc, b| {
-        acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize
-    }) - 1
+    crate::data::parse_column(s).expect("Invalid Excel column")
 }
-
 pub fn split_coord(coord: &str) -> (u32, u32) {
-    let p = coord.find(|c: char| c.is_ascii_digit()).unwrap();
-    (
-        col_index(&coord[..p]) as u32,
-        coord[p..].parse::<u32>().unwrap(),
-    )
+    let (col, row) = crate::data::parse_coord(coord).expect("Invalid Excel coordinate");
+    (col as u32, row)
 }
 
 #[inline]
@@ -37,15 +31,18 @@ pub fn find_bytes_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize>
 }
 
 pub fn bump_count(xml: &mut Vec<u8>, tag: &[u8], attr: &[u8]) -> Result<()> {
-    if let Some(pos) = memmem::rfind(xml, tag) {
-        if let Some(a) = find_bytes_from(xml, attr, pos) {
-            let start = a + attr.len();
-            let end = find_bytes_from(xml, b"\"", start).context("closing quote not found")?;
-            let mut num: u32 = std::str::from_utf8(&xml[start..end])?.parse()?;
-            num += 1;
-            xml.splice(start..end, num.to_string().bytes());
-            return Ok(());
-        }
-    }
-    Err(anyhow::anyhow!("attribute count not found"))
+    let name = std::str::from_utf8(tag)?
+        .trim_start_matches('<')
+        .trim_end_matches('>');
+    let attribute = std::str::from_utf8(attr)?.trim_end_matches(['=', '\"']);
+    let element = crate::xml::require(xml, name)?;
+    let value: u32 = element
+        .attr(attribute)?
+        .context("XML count attribute missing")?
+        .parse()?;
+    let next = value.checked_add(1).context("XML count overflow")?;
+    let opening = element.set_attr(attribute, Some(&next.to_string()))?;
+    let range = element.open;
+    xml.splice(range, opening);
+    Ok(())
 }

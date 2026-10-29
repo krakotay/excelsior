@@ -38,7 +38,7 @@ benchmark = ["openpyxl>=3.1.5", "polars>=1.35", "pandas>=2.2", "pyarrow>=20"]
 bindings = "pyo3"
 module-name = "excelsior.excelsior"
 python-source = "."
-exclude = ["excelsior/*.pdb"]
+exclude = ["excelsior/*.pdb", "**/uv.lock"]
 include = [
     { path = "README.md", format = "sdist" },
     "excelsior/__init__.pyi",

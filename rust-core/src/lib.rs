@@ -2,10 +2,16 @@
 
 // #[global_allocator]
 // static GLOBAL: MiMalloc = MiMalloc;
+mod archive;
 pub mod data;
+mod rows;
+mod shared;
+mod xml;
+use shared::{Bytes, Shared};
 pub mod files_part;
+pub mod streaming;
 pub mod workbook;
-use memchr::memmem;
+pub use streaming::WorkbookWriter;
 pub use workbook::create_excel;
 mod read_part;
 pub mod style;
@@ -18,7 +24,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use quick_xml::{Reader, events::Event};
 
 use crate::{
     files_part::sheet_path_for_name,
@@ -77,19 +82,30 @@ struct StyleIndex {
 #[derive(Clone)]
 pub struct XlsxEditor {
     src_path: PathBuf,
+    source: archive::Source,
     sheet_path: String,
-    sheet_xml: Vec<u8>,
+    sheet_xml: Bytes,
     last_row: u32,
-    styles_xml: Vec<u8>,   // содержимое styles.xml
-    workbook_xml: Vec<u8>, // содержимое workbook.xml (может изменяться)
-    rels_xml: Vec<u8>,     // содержимое workbook.xml.rels
-    new_files: HashMap<String, Vec<u8>>,
-    styles_index: Option<StyleIndex>,
-    loaded_files: std::collections::HashMap<String, Vec<u8>>,
-    removed_files: HashSet<String>, // ← НОВОЕ: пути внутри ZIP, которые надо выкинуть
+    sheet_data_end: Option<usize>,
+    row_index: Option<Shared<rows::RowIndex>>,
+    dimensions: Shared<HashMap<String, (usize, u32)>>,
+    styles_xml: Bytes,   // содержимое styles.xml
+    workbook_xml: Bytes, // содержимое workbook.xml (может изменяться)
+    rels_xml: Bytes,     // содержимое workbook.xml.rels
+    new_files: Shared<HashMap<String, Bytes>>,
+    styles_index: Option<Shared<StyleIndex>>,
+    loaded_files: Shared<HashMap<String, Bytes>>,
+    removed_files: Shared<HashSet<String>>, // ← НОВОЕ: пути внутри ZIP, которые надо выкинуть
 }
 
 impl XlsxEditor {
+    pub fn is_empty_sheet(&self) -> bool {
+        self.last_row == 0
+    }
+    pub fn source_path(&self) -> &Path {
+        &self.src_path
+    }
+
     /// Creates an empty workbook on disk and opens its first sheet for editing.
     /// An existing destination is replaced, just as with `create_excel`.
     pub fn create<P: AsRef<Path>>(path: P, sheet_name: &str) -> Result<Self> {
@@ -99,8 +115,8 @@ impl XlsxEditor {
 
     /// Opens an XLSX file and prepares a specific sheet for editing by its name.
     ///
-    /// This function first scans the workbook to find the sheet ID corresponding to the given sheet name,
-    /// then calls `open_sheet` with the found ID.
+    /// Resolve the selected sheet through workbook relationships, then open its
+    /// actual package path (which need not match its numeric sheet ID).
     ///
     /// # Arguments
     /// * `src` - The path to the XLSX file.
@@ -184,10 +200,12 @@ impl XlsxEditor {
     /// # Returns
     /// A `Result` indicating success or an `anyhow::Error` if the operation fails.
     pub fn set_cell<S: ToString>(&mut self, coord: &str, value: S) -> Result<()> {
-        self.write_typed_table_at(
-            coord,
-            std::iter::once(Ok(vec![data::CellValue::infer(value.to_string())])),
-        )
+        let (col, row) = data::parse_coord(coord)?;
+        let value = data::CellValue::infer(value.to_string());
+        if row <= self.last_row && self.replace_indexed_cell(col, row, &value)? {
+            return Ok(());
+        }
+        self.write_typed_table_at(coord, std::iter::once(Ok(vec![value])))
     }
 }
 
@@ -196,157 +214,94 @@ fn build_row_xml(
     start_col_idx: usize,
     values: &[data::CellValue],
 ) -> Result<Vec<u8>> {
+    build_styled_row_xml(
+        row_num,
+        start_col_idx,
+        values,
+        &std::collections::BTreeMap::new(),
+    )
+}
+fn build_styled_row_xml(
+    row_num: u32,
+    start_col_idx: usize,
+    values: &[data::CellValue],
+    styles: &std::collections::BTreeMap<usize, u32>,
+) -> Result<Vec<u8>> {
     let mut row = Vec::new();
     row.extend_from_slice(format!(r#"<row r="{row_num}">"#).as_bytes());
     for (offset, value) in values.iter().enumerate() {
         let coord = format!("{}{}", col_idx_to_letters(start_col_idx + offset), row_num);
-        row.extend_from_slice(&data::build_typed_cell_xml(&coord, value, None)?);
+        row.extend_from_slice(&data::build_typed_cell_xml(
+            &coord,
+            value,
+            styles.get(&(start_col_idx + offset)).copied(),
+        )?);
     }
     row.extend_from_slice(b"</row>");
     Ok(row)
 }
 
 fn patch_row_xml(
-    row_xml: &[u8],
+    row: &xml::Element<'_>,
     row_num: u32,
     start_col_idx: usize,
     values: &[data::CellValue],
 ) -> Result<Vec<u8>> {
-    let row_slice = if row_xml.ends_with(b"/>") {
-        let mut expanded = row_xml[..row_xml.len() - 2].to_vec();
-        expanded.extend_from_slice(b"></row>");
-        expanded
-    } else {
-        row_xml.to_vec()
-    };
-    let row_tag_end = find_bytes(&row_slice, b">").context("malformed row tag")?;
-    let content_start = row_tag_end + 1;
-    let content_end = row_slice.len() - "</row>".len();
-
-    let find_c = memmem::Finder::new(b"<c");
-    let find_gt = memmem::Finder::new(b">");
-
-    let mut cell_ranges: Vec<(usize, usize, usize)> = Vec::new();
-    let mut j = content_start;
-    while j < content_end {
-        let Some(cpos_rel) = find_c.find(&row_slice[j..content_end]) else {
-            break;
-        };
-        let cpos = j + cpos_rel;
-        let next = *row_slice.get(cpos + 2).unwrap_or(&b'>');
-        let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
-        let tag_end = find_gt
-            .find(&row_slice[cpos..content_end])
-            .context("cell tag end")?
-            + cpos;
-        if !is_cell {
-            j = tag_end + 1;
-            continue;
-        }
-
-        let self_closing = tag_end > cpos && row_slice[tag_end - 1] == b'/';
-        let cell_end = if self_closing {
-            tag_end + 1
+    let mut cells = std::collections::BTreeMap::new();
+    let mut others = Vec::new();
+    for element in row.children() {
+        let element = element?;
+        if element.is("c", xml::SHEET_NS) {
+            let coord = element.attr("r")?.context("Cell coordinate missing")?;
+            let (col, _) = data::parse_coord(&coord)?;
+            anyhow::ensure!(
+                cells.insert(col, element).is_none(),
+                "Duplicate cell coordinate"
+            );
         } else {
-            let close =
-                find_bytes_from(&row_slice, b"</c>", tag_end + 1).context("</c> missing")?;
-            close + 4
-        };
-
-        if let Some(cell_col) = extract_cell_col_idx(&row_slice[cpos..cell_end]) {
-            cell_ranges.push((cell_col, cpos, cell_end));
-        }
-        j = cell_end;
-    }
-
-    let mut replacements: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-    let mut inserts: Vec<(usize, Vec<u8>)> = Vec::new();
-
-    for (offset, value) in values.iter().enumerate() {
-        let col_idx = start_col_idx + offset;
-        let coord = format!("{}{}", col_idx_to_letters(col_idx), row_num);
-        match cell_ranges.binary_search_by_key(&col_idx, |(cell_col, _, _)| *cell_col) {
-            Ok(ix) => {
-                let (_, start, end) = cell_ranges[ix];
-                let style_id = extract_style_id(&row_slice[start..end]);
-                replacements.push((
-                    start,
-                    end,
-                    data::build_typed_cell_xml(&coord, value, style_id)?,
-                ));
-            }
-            Err(ix) => {
-                let insert_at = if ix < cell_ranges.len() {
-                    cell_ranges[ix].1
-                } else {
-                    content_end
-                };
-                inserts.push((insert_at, data::build_typed_cell_xml(&coord, value, None)?));
-            }
+            others.push(element);
         }
     }
-
-    let mut out = Vec::with_capacity(row_slice.len() + values.len() * 32);
-    let mut cursor = 0usize;
-    replacements.sort_by_key(|(start, _, _)| *start);
-    inserts.sort_by_key(|(pos, _)| *pos);
-    let mut insert_ix = 0usize;
-
-    for (start, end, replacement) in replacements {
-        while insert_ix < inserts.len() && inserts[insert_ix].0 <= start {
-            let (pos, ref insert) = inserts[insert_ix];
-            out.extend_from_slice(&row_slice[cursor..pos]);
-            out.extend_from_slice(insert);
-            cursor = pos;
-            insert_ix += 1;
+    let mut content = Vec::new();
+    let mut replacements = values.iter().enumerate().peekable();
+    for (col, cell) in cells {
+        while replacements
+            .peek()
+            .is_some_and(|(offset, _)| start_col_idx + offset < col)
+        {
+            let (offset, value) = replacements.next().unwrap();
+            let coord = format!("{}{}", col_idx_to_letters(start_col_idx + offset), row_num);
+            content.extend_from_slice(&xml::child_fragment(
+                row,
+                &data::build_typed_cell_xml(&coord, value, None)?,
+            )?);
         }
-        out.extend_from_slice(&row_slice[cursor..start]);
-        out.extend_from_slice(&replacement);
-        cursor = end;
+        if replacements
+            .peek()
+            .is_some_and(|(offset, _)| start_col_idx + offset == col)
+        {
+            let (_, value) = replacements.next().unwrap();
+            let sid = cell.attr("s")?.map(|v| v.parse::<u32>()).transpose()?;
+            let coord = format!("{}{}", col_idx_to_letters(col), row_num);
+            content.extend_from_slice(&xml::child_fragment(
+                row,
+                &data::build_typed_cell_xml(&coord, value, sid)?,
+            )?);
+        } else {
+            content.extend_from_slice(cell.bytes());
+        }
     }
-
-    while insert_ix < inserts.len() {
-        let (pos, ref insert) = inserts[insert_ix];
-        out.extend_from_slice(&row_slice[cursor..pos]);
-        out.extend_from_slice(insert);
-        cursor = pos;
-        insert_ix += 1;
+    for (offset, value) in replacements {
+        let coord = format!("{}{}", col_idx_to_letters(start_col_idx + offset), row_num);
+        content.extend_from_slice(&xml::child_fragment(
+            row,
+            &data::build_typed_cell_xml(&coord, value, None)?,
+        )?);
     }
-
-    out.extend_from_slice(&row_slice[cursor..]);
-    Ok(out)
-}
-
-fn extract_style_id(cell_xml: &[u8]) -> Option<u32> {
-    let style_pos = find_bytes(cell_xml, b" s=\"")?;
-    let val_start = style_pos + 4;
-    let val_end = find_bytes_from(cell_xml, b"\"", val_start)?;
-    std::str::from_utf8(&cell_xml[val_start..val_end])
-        .ok()?
-        .parse()
-        .ok()
-}
-
-fn extract_cell_col_idx(cell_xml: &[u8]) -> Option<usize> {
-    let coord_pos = find_bytes(cell_xml, b" r=\"")?;
-    let val_start = coord_pos + 4;
-    let val_end = find_bytes_from(cell_xml, b"\"", val_start)?;
-    let coord = std::str::from_utf8(&cell_xml[val_start..val_end]).ok()?;
-    let letters_len = coord.find(|c: char| c.is_ascii_digit())?;
-    Some(letters_to_col_idx(&coord[..letters_len]))
-}
-
-fn parse_row_number(src: &[u8], row_start: usize, row_tag_end: usize) -> Option<u32> {
-    let rpos = find_bytes_from(src, b" r=\"", row_start)?;
-    if rpos >= row_tag_end {
-        return None;
+    for element in others {
+        content.extend_from_slice(element.bytes());
     }
-    let value_start = rpos + 4;
-    let value_end = find_bytes_from(src, b"\"", value_start)?;
-    std::str::from_utf8(&src[value_start..value_end])
-        .ok()?
-        .parse()
-        .ok()
+    row.with_content(&content)
 }
 
 fn col_idx_to_letters(mut idx: usize) -> String {
@@ -362,46 +317,22 @@ fn col_idx_to_letters(mut idx: usize) -> String {
     s
 }
 
-fn letters_to_col_idx(s: &str) -> usize {
-    s.bytes().fold(0, |acc, b| {
-        acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize
-    }) - 1
-}
-
-pub fn scan<P: AsRef<Path>>(src: P) -> Result<Vec<String>> {
-    let mut zip = zip::ZipArchive::new(File::open(src)?)?;
-    let mut wb = zip
-        .by_name("xl/workbook.xml")
-        .context("workbook.xml not found")?;
-
-    let mut wb_xml = Vec::with_capacity(wb.size() as usize);
-    wb.read_to_end(&mut wb_xml)?;
-
-    let mut reader = Reader::from_reader(wb_xml.as_slice());
-    reader.config_mut().trim_text(true);
-
+pub fn scan<P: AsRef<Path>>(source: P) -> Result<Vec<String>> {
+    let mut archive = zip::ZipArchive::new(File::open(source)?)?;
+    let mut part = archive.by_name("xl/workbook.xml")?;
+    let mut bytes = Vec::new();
+    part.read_to_end(&mut bytes)?;
+    let sheets = xml::require(&bytes, "sheets")?;
     let mut names = Vec::new();
-
-    while let Ok(ev) = reader.read_event() {
-        match ev {
-            Event::Empty(ref e) | Event::Start(ref e)
-                if e.name().as_ref().as_bytes() == b"sheet" =>
-            {
-                if let Some(attribute) = e
-                    .attributes()
-                    .with_checks(false)
-                    .flatten()
-                    .find(|a| a.key.as_ref().as_bytes() == b"name")
-                {
-                    names.push(
-                        attribute
-                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                            .into_owned(),
-                    );
-                }
-            }
-            Event::Eof => break,
-            _ => {}
+    for sheet in sheets.children() {
+        let sheet = sheet?;
+        if sheet.is("sheet", xml::SHEET_NS) {
+            names.push(
+                sheet
+                    .attr("name")?
+                    .context("Sheet name missing")?
+                    .into_owned(),
+            );
         }
     }
     Ok(names)
@@ -422,68 +353,33 @@ impl XlsxEditor {
             col_idx_to_letters(c1),
             r1
         );
-        let range = normalized.as_str();
-        // 1. позиция после </sheetData>
-        let sd_end = find_bytes(&self.sheet_xml, b"</sheetData>")
-            .context("</sheetData> not found")?
-            + "</sheetData>".len();
-
-        let (insert_pos, created) = if let Some(pos) = find_bytes(&self.sheet_xml, b"<mergeCells") {
-            // уже есть блок
-            bump_count(&mut self.sheet_xml, b"<mergeCells", b"count=\"")?;
-            let end = find_bytes_from(&self.sheet_xml, b"</mergeCells>", pos)
-                .context("</mergeCells> not found")?;
-            (end, false)
+        let root = xml::root(&self.sheet_xml)?;
+        let tag = format!(r#"<mergeCell ref="{normalized}"/>"#);
+        let updated = if let Some(merges) = root.child("mergeCells")? {
+            let mut content = self.sheet_xml[merges.content.clone()].to_vec();
+            content.extend_from_slice(&xml::child_fragment(&merges, tag.as_bytes())?);
+            let count = merges.children().count() + 1;
+            let replacement = merges.with_content(&content)?;
+            let element = xml::root(&replacement)?;
+            let opening = element.set_attr("count", Some(&count.to_string()))?;
+            let mut replacement = replacement.clone();
+            replacement.splice(element.open, opening);
+            xml::replace_element(&self.sheet_xml, &merges, &replacement)
         } else {
-            // нет блока – создаём
-            let tpl = br#"<mergeCells count="0"></mergeCells>"#;
-            self.sheet_xml.splice(sd_end..sd_end, tpl.iter().copied());
-            (sd_end + tpl.len() - "</mergeCells>".len(), true)
+            let data = root.require_child("sheetData")?;
+            let block = format!(r#"<mergeCells count="1">{tag}</mergeCells>"#);
+            let mut out = self.sheet_xml.to_vec();
+            out.splice(
+                data.full.end..data.full.end,
+                xml::child_fragment(&root, block.as_bytes())?
+                    .iter()
+                    .copied(),
+            );
+            out
         };
-
-        // 2. сам <mergeCell>
-        let tag = format!(r#"<mergeCell ref="{}"/>"#, range);
-        self.sheet_xml
-            .splice(insert_pos..insert_pos, tag.as_bytes().iter().copied());
-
-        // 3. правим count (если блок создан только что)
-        if created {
-            bump_count(&mut self.sheet_xml, b"<mergeCells", b"count=\"")?;
-        }
+        self.sheet_xml = updated.into();
+        self.sheet_data_end = None;
+        self.row_index = None;
         Ok(())
     }
-}
-
-fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-fn find_bytes_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
-    hay[start..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + start)
-}
-
-fn bump_count(xml: &mut Vec<u8>, tag: &[u8], attr: &[u8]) -> Result<()> {
-    if let Some(pos) = find_bytes(xml, tag) {
-        if let Some(a) = find_bytes_from(xml, attr, pos) {
-            let start = a + attr.len();
-            let end = find_bytes_from(xml, b"\"", start).unwrap();
-            let mut num: u32 = std::str::from_utf8(&xml[start..end])?.parse()?;
-            num += 1;
-            xml.splice(start..end, num.to_string().as_bytes().iter().copied());
-            return Ok(());
-        }
-    }
-    Err(anyhow::anyhow!("attribute count not found"))
-}
-
-fn ensure_sheetdata_open_close(xml: &mut Vec<u8>) -> Result<()> {
-    const SELF_CLOSING: &[u8] = b"<sheetData/>";
-    if let Some(pos) = memchr::memmem::find(xml, SELF_CLOSING) {
-        // заменяем на <sheetData></sheetData>
-        let replacement = b"<sheetData></sheetData>";
-        xml.splice(pos..pos + SELF_CLOSING.len(), replacement.iter().copied());
-    }
-    Ok(())
 }

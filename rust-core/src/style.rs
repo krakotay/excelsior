@@ -1,13 +1,10 @@
 //! style.rs – универсальный слой стилей + нормализация <cols>
 
 use anyhow::{Context, Result, bail};
-use memchr::{memchr, memmem, memrchr};
-use quick_xml::{Reader, events::Event};
 use std::collections::HashMap;
 use std::{fmt, str::FromStr};
 
 use crate::files_part::needs_xml_space_preserve;
-use crate::style::util::{bump_count, find_bytes_from};
 use crate::{FontKey, StyleIndex, StyleKey, XfParts, XlsxEditor};
 
 mod cols;
@@ -108,6 +105,7 @@ pub struct StyleSpec {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StyleParts {
+    pub num_fmt_id: Option<u32>,
     pub num_fmt_code: Option<String>,
     pub font: Option<u32>,
     pub fill: Option<u32>,
@@ -119,10 +117,28 @@ pub(crate) struct StyleParts {
 
 #[derive(Debug)]
 enum Target {
+    All,
     Cell(String),
     Rect { c0: u32, r0: u32, c1: u32, r1: u32 },
     Col(u32), // 0-based
     Row(u32),
+}
+
+impl Target {
+    fn matches(&self, col: u32, row: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Cell(c) => crate::data::parse_coord(c).is_ok_and(|v| v == (col as usize, row)),
+            Self::Rect { c0, r0, c1, r1 } => {
+                col >= (*c0).min(*c1)
+                    && col <= (*c0).max(*c1)
+                    && row >= (*r0).min(*r1)
+                    && row <= (*r0).max(*r1)
+            }
+            Self::Col(c) => col == *c,
+            Self::Row(r) => row == *r,
+        }
+    }
 }
 
 fn parse_target(s: &str) -> Result<Target> {
@@ -190,401 +206,186 @@ fn parse_open_column_selector(s: &str) -> Option<(u32, u32)> {
 
 impl StyleIndex {
     fn build(styles: &[u8]) -> Result<Self> {
-        let mut ix = StyleIndex {
+        use crate::xml;
+        fn number(element: &xml::Element<'_>, name: &str) -> Result<Option<u32>> {
+            Ok(element.attr(name)?.map(|v| v.parse()).transpose()?)
+        }
+        fn flag(element: &xml::Element<'_>) -> Result<bool> {
+            Ok(!matches!(
+                element.attr("val")?.as_deref(),
+                Some("0" | "false")
+            ))
+        }
+        let root = xml::root(styles)?;
+        let mut ix = Self {
             xfs: Vec::new(),
             numfmt_by_code: HashMap::new(),
             numfmt_code_by_id: HashMap::new(),
             next_custom_numfmt: 164,
-
             font_by_key: HashMap::new(),
             fill_by_rgb: HashMap::new(),
             border_by_key: HashMap::new(),
             xf_by_key: HashMap::new(),
-
             fonts_count: 0,
             fills_count: 0,
             borders_count: 0,
         };
         seed_builtin_num_fmts(&mut ix);
-
-        let mut rdr = Reader::from_reader(styles);
-        rdr.config_mut().trim_text(true);
-
-        // --- numFmts ---
-        // Сканируем блок <numFmts> и заполняем карту code->id, заодно поднимаем next_custom_numfmt
-        let mut max_custom = 163u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if e.name().as_ref().as_bytes() == b"numFmt" =>
-                {
-                    let mut id = None::<u32>;
-                    let mut code = None::<String>;
-                    for a in e.attributes().with_checks(false).flatten() {
-                        match a.key.as_ref().as_bytes() {
-                            b"numFmtId" => id = Some(lexical_core::parse(a.value.as_bytes())?),
-                            b"formatCode" => {
-                                code = Some(
-                                    a.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                                        .into_owned(),
-                                )
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let (Some(i), Some(c)) = (id, code) {
-                        ix.numfmt_by_code.insert(c.clone(), i);
-                        ix.numfmt_code_by_id.insert(i, c);
-                        if i > max_custom {
-                            max_custom = i;
-                        }
-                    }
+        if let Some(formats) = root.child("numFmts")? {
+            for entry in formats.children() {
+                let entry = entry?;
+                if !entry.is("numFmt", xml::SHEET_NS) {
+                    continue;
                 }
-                Event::Eof => break,
-                _ => {}
+                let id = number(&entry, "numFmtId")?.context("numFmtId missing")?;
+                let code = entry
+                    .attr("formatCode")?
+                    .context("formatCode missing")?
+                    .into_owned();
+                ix.numfmt_by_code.insert(code.clone(), id);
+                ix.numfmt_code_by_id.insert(id, code);
+                ix.next_custom_numfmt = ix.next_custom_numfmt.max(id + 1);
             }
         }
-        ix.next_custom_numfmt = max_custom.max(163) + 1;
-
-        // --- fonts ---
-        // Пройдём ещё раз для удобства (можно и за один проход, но так проще)
-        let mut rdr = Reader::from_reader(styles);
-        rdr.config_mut().trim_text(true);
-        let mut in_fonts = false;
-        let mut font_id = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"fonts" => in_fonts = true,
-                Event::End(ref e) if e.name().as_ref().as_bytes() == b"fonts" => {
-                    // in_fonts = false;
-                    break;
+        if let Some(fonts) = root.child("fonts")? {
+            for font in fonts.children() {
+                let font = font?;
+                if !font.is("font", xml::SHEET_NS) {
+                    continue;
                 }
-                Event::Start(ref e) if in_fonts && e.name().as_ref().as_bytes() == b"font" => {
-                    // читаем <font> целиком
-                    let mut depth = 1;
-                    let mut bold = false;
-                    let mut italic = false;
-                    let mut size: f32 = 11.0;
-                    let mut name: String = "Calibri".into();
-
-                    while depth > 0 {
-                        match rdr.read_event()? {
-                            Event::Start(ref fe) => {
-                                depth += 1;
-                                match fe.name().as_ref().as_bytes() {
-                                    b"b" => bold = true,
-                                    b"i" => italic = true,
-                                    b"sz" => {
-                                        for a in fe.attributes().with_checks(false).flatten() {
-                                            if a.key.as_ref().as_bytes() == b"val" {
-                                                size = a.value.clone().parse().unwrap_or(11.0);
-                                            }
-                                        }
-                                    }
-                                    b"name" => {
-                                        for a in fe.attributes().with_checks(false).flatten() {
-                                            if a.key.as_ref().as_bytes() == b"val" {
-                                                name = a
-                                                    .normalized_value(
-                                                        quick_xml::XmlVersion::Implicit1_0,
-                                                    )?
-                                                    .into_owned();
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Event::Empty(ref fe) => match fe.name().as_ref().as_bytes() {
-                                b"b" => bold = true,
-                                b"i" => italic = true,
-                                b"sz" => {
-                                    for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"val" {
-                                            size = a.value.clone().parse().unwrap_or(11.0);
-                                        }
-                                    }
-                                }
-                                b"name" => {
-                                    for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"val" {
-                                            name = a
-                                                .normalized_value(
-                                                    quick_xml::XmlVersion::Implicit1_0,
-                                                )?
-                                                .into_owned();
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            },
-                            Event::End(_) => depth -= 1,
-                            Event::Eof => break,
-                            _ => {}
-                        }
-                    }
-
-                    let key = FontKey {
+                let name = font
+                    .child("name")?
+                    .map(|n| n.attr("val").map(|s| s.map(|s| s.into_owned())))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or_else(|| "Calibri".to_owned());
+                let size = font
+                    .child("sz")?
+                    .map(|n| {
+                        n.attr("val").and_then(|s| {
+                            s.map(|s| s.parse::<f32>().map_err(Into::into)).transpose()
+                        })
+                    })
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(11.0);
+                anyhow::ensure!(
+                    size.is_finite() && size > 0.0,
+                    "Invalid font size in styles.xml"
+                );
+                let bold = font
+                    .child("b")?
+                    .map(|v| flag(&v))
+                    .transpose()?
+                    .unwrap_or(false);
+                let italic = font
+                    .child("i")?
+                    .map(|v| flag(&v))
+                    .transpose()?
+                    .unwrap_or(false);
+                ix.font_by_key.insert(
+                    FontKey {
                         name,
                         size_100: (size * 100.0).round() as u32,
                         bold,
                         italic,
-                    };
-                    ix.font_by_key.entry(key).or_insert(font_id);
-                    font_id += 1;
-                }
-                Event::Eof => break,
-                _ => {}
+                    },
+                    ix.fonts_count,
+                );
+                ix.fonts_count += 1;
             }
         }
-        ix.fonts_count = font_id;
-
-        // --- fills ---
-        let mut rdr = Reader::from_reader(styles);
-        rdr.config_mut().trim_text(true);
-        let mut in_fills = false;
-        let mut fill_id = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"fills" => in_fills = true,
-                Event::End(ref e) if e.name().as_ref().as_bytes() == b"fills" => {
-                    // in_fills = false;
-                    break;
+        if let Some(fills) = root.child("fills")? {
+            for fill in fills.children() {
+                let fill = fill?;
+                if !fill.is("fill", xml::SHEET_NS) {
+                    continue;
                 }
-                Event::Start(ref e) if in_fills && e.name().as_ref().as_bytes() == b"fill" => {
-                    // считываем <fill> целиком; учитываем только solid fgColor rgb
-                    let mut depth = 1;
-                    let mut rgb: Option<String> = None;
-
-                    while depth > 0 {
-                        match rdr.read_event()? {
-                            Event::Start(ref fe) => {
-                                if fe.name().as_ref().as_bytes() == b"fgColor" {
-                                    for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"rgb" {
-                                            let mut v = a.value.clone().into_owned();
-                                            v.make_ascii_uppercase();
-                                            rgb = Some(v);
-                                        }
-                                    }
-                                }
-                                depth += 1;
-                            }
-                            Event::Empty(ref fe) => {
-                                if fe.name().as_ref().as_bytes() == b"fgColor" {
-                                    for a in fe.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"rgb" {
-                                            let mut v = a.value.clone().into_owned();
-                                            v.make_ascii_uppercase();
-                                            rgb = Some(v);
-                                        }
-                                    }
-                                }
-                                // depth не меняем
-                            }
-                            Event::End(_) => depth -= 1,
-                            Event::Eof => break,
-                            _ => {}
-                        }
-                    }
-
-                    if let Some(k) = rgb {
-                        ix.fill_by_rgb.entry(k).or_insert(fill_id);
-                    }
-                    fill_id += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        ix.fills_count = fill_id;
-
-        // --- borders ---
-        let mut rdr = Reader::from_reader(styles);
-        rdr.config_mut().trim_text(true);
-        let mut in_borders = false;
-        let mut border_id = 0u32;
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"borders" => {
-                    in_borders = true
-                }
-                Event::End(ref e) if e.name().as_ref().as_bytes() == b"borders" => {
-                    // in_borders = false;
-                    break;
-                }
-                Event::Start(ref e) if in_borders && e.name().as_ref().as_bytes() == b"border" => {
-                    let mut depth = 1;
-                    let mut styles = [None, None, None, None]; // left,right,top,bottom
-
-                    while depth > 0 {
-                        match rdr.read_event()? {
-                            Event::Start(ref be) => {
-                                let side = match be.name().as_ref().as_bytes() {
-                                    b"left" => Some(0),
-                                    b"right" => Some(1),
-                                    b"top" => Some(2),
-                                    b"bottom" => Some(3),
-                                    _ => None,
-                                };
-                                if let Some(i) = side {
-                                    for a in be.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"style" {
-                                            styles[i] = Some(a.value.clone().into_owned());
-                                        }
-                                    }
-                                }
-                                depth += 1;
-                            }
-                            Event::Empty(ref be) => {
-                                let side = match be.name().as_ref().as_bytes() {
-                                    b"left" => Some(0),
-                                    b"right" => Some(1),
-                                    b"top" => Some(2),
-                                    b"bottom" => Some(3),
-                                    _ => None,
-                                };
-                                if let Some(i) = side {
-                                    for a in be.attributes().with_checks(false).flatten() {
-                                        if a.key.as_ref().as_bytes() == b"style" {
-                                            styles[i] = Some(a.value.clone().into_owned());
-                                        }
-                                    }
-                                }
-                            }
-
-                            Event::End(_) => depth -= 1,
-                            Event::Eof => break,
-                            _ => {}
-                        }
-                    }
-
-                    // ключ только для «ровных» рамок, иначе пропускаем (мы такие и создаём)
-                    if let (Some(l), Some(r), Some(t), Some(b)) =
-                        (&styles[0], &styles[1], &styles[2], &styles[3])
-                    {
-                        if l == r && r == t && t == b {
-                            ix.border_by_key.entry(l.clone()).or_insert(border_id);
-                        }
-                    }
-                    border_id += 1;
-                }
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        ix.borders_count = border_id;
-
-        // --- cellXfs ---
-        let mut rdr = Reader::from_reader(styles);
-        rdr.config_mut().trim_text(true);
-        let mut in_xfs = false;
-        let mut xf_id = 0u32;
-
-        while let Ok(ev) = rdr.read_event() {
-            match ev {
-                Event::Start(ref e) if e.name().as_ref().as_bytes() == b"cellXfs" => in_xfs = true,
-                Event::End(ref e) if e.name().as_ref().as_bytes() == b"cellXfs" => {
-                    // in_xfs = false;
-                    break;
-                }
-
-                Event::Start(ref e) | Event::Empty(ref e)
-                    if in_xfs && e.name().as_ref().as_bytes() == b"xf" =>
+                if let Some(pattern) = fill.child("patternFill")?
+                    && let Some(color) = pattern.child("fgColor")?
+                    && let Some(rgb) = color.attr("rgb")?
                 {
-                    let mut num_fmt_id = 0u32;
-                    let mut font_id: Option<u32> = None;
-                    let mut fill_id: Option<u32> = None;
-                    let mut border_id: Option<u32> = None;
-
-                    for a in e.attributes().with_checks(false).flatten() {
-                        match a.key.as_ref().as_bytes() {
-                            b"numFmtId" => {
-                                num_fmt_id = lexical_core::parse(a.value.as_bytes()).unwrap_or(0)
-                            }
-                            b"fontId" => {
-                                font_id = Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
-                            }
-                            b"fillId" => {
-                                fill_id = Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
-                            }
-                            b"borderId" => {
-                                border_id =
-                                    Some(lexical_core::parse(a.value.as_bytes()).unwrap_or(0))
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // выцепим alignment (если есть)
-                    let mut align: Option<AlignSpec> = None;
-                    if matches!(ev, Event::Start(_)) {
-                        let mut depth = 1;
-                        while depth > 0 {
-                            match rdr.read_event()? {
-                                Event::Start(ref ae) => {
-                                    depth += 1;
-                                    if ae.name().as_ref().as_bytes() == b"alignment" {
-                                        let mut spec = AlignSpec::default();
-                                        for a in ae.attributes().with_checks(false).flatten() {
-                                            let v = a.value.clone().into_owned();
-                                            match a.key.as_ref().as_bytes() {
-                                                b"horizontal" => spec.horiz = Some(v.parse()?),
-                                                b"vertical" => spec.vert = Some(v.parse()?),
-                                                b"wrapText" => {
-                                                    if v == "1" {
-                                                        spec.wrap = true
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        align = Some(spec);
-                                    }
-                                }
-                                Event::End(_) => depth -= 1,
-                                Event::Eof => break,
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    ix.xfs.push(XfParts {
-                        num_fmt_id,
-                        font_id,
-                        fill_id,
-                        border_id,
-                        align: align.clone(),
-                    });
-
-                    let sk = StyleKey {
-                        num_fmt_id,
-                        font_id,
-                        fill_id,
-                        border_id,
-                        align: align
-                            .as_ref()
-                            .map(|a| (a.horiz.clone(), a.vert.clone(), a.wrap)),
-                    };
-                    ix.xf_by_key.entry(sk).or_insert(xf_id);
-                    xf_id += 1;
+                    ix.fill_by_rgb
+                        .insert(rgb.to_ascii_uppercase(), ix.fills_count);
                 }
-                Event::Eof => break,
-                _ => {}
+                ix.fills_count += 1;
             }
         }
-
+        if let Some(borders) = root.child("borders")? {
+            for border in borders.children() {
+                let border = border?;
+                if !border.is("border", xml::SHEET_NS) {
+                    continue;
+                }
+                let mut sides = Vec::new();
+                let mut plain = true;
+                for name in ["left", "right", "top", "bottom"] {
+                    if let Some(side) = border.child(name)? {
+                        plain &= side.child("color")?.is_none();
+                        sides.push(side.attr("style")?.map(|v| v.into_owned()));
+                    } else {
+                        sides.push(None);
+                    }
+                }
+                if plain
+                    && sides.iter().all(|s| s == &sides[0])
+                    && let Some(style) = &sides[0]
+                {
+                    ix.border_by_key.insert(style.clone(), ix.borders_count);
+                }
+                ix.borders_count += 1;
+            }
+        }
+        let xfs = root.require_child("cellXfs")?;
+        for xf in xfs.children() {
+            let xf = xf?;
+            if !xf.is("xf", xml::SHEET_NS) {
+                continue;
+            }
+            let num_fmt_id = number(&xf, "numFmtId")?.unwrap_or(0);
+            let font_id = number(&xf, "fontId")?;
+            let fill_id = number(&xf, "fillId")?;
+            let border_id = number(&xf, "borderId")?;
+            let align = if let Some(alignment) = xf.child("alignment")? {
+                Some(AlignSpec {
+                    horiz: alignment
+                        .attr("horizontal")?
+                        .map(|v| v.parse())
+                        .transpose()?,
+                    vert: alignment.attr("vertical")?.map(|v| v.parse()).transpose()?,
+                    wrap: matches!(alignment.attr("wrapText")?.as_deref(), Some("1" | "true")),
+                })
+            } else {
+                None
+            };
+            let key = StyleKey {
+                num_fmt_id,
+                font_id,
+                fill_id,
+                border_id,
+                align: align
+                    .as_ref()
+                    .map(|a| (a.horiz.clone(), a.vert.clone(), a.wrap)),
+            };
+            let sid = ix.xfs.len() as u32;
+            ix.xf_by_key.insert(key, sid);
+            ix.xfs.push(XfParts {
+                num_fmt_id,
+                font_id,
+                fill_id,
+                border_id,
+                align,
+            });
+        }
         Ok(ix)
     }
 }
-
 impl XlsxEditor {
     fn style_ix_mut(&mut self) -> Result<&mut StyleIndex> {
         if self.styles_index.is_none() {
-            let ix = StyleIndex::build(&self.styles_xml)?;
-            self.styles_index = Some(ix);
+            self.styles_index = Some(StyleIndex::build(&self.styles_xml)?.into());
         }
-        Ok(self.styles_index.as_mut().unwrap())
+        Ok(&mut *self.styles_index.as_mut().unwrap())
     }
 }
 
@@ -642,6 +443,7 @@ impl XlsxEditor {
         };
 
         Ok(StyleParts {
+            num_fmt_id: None,
             num_fmt_code: spec.num_fmt_code.clone(),
             font,
             fill,
@@ -739,6 +541,7 @@ impl XlsxEditor {
     }
     pub fn remove_style(&mut self, range: &str) -> Result<&mut Self> {
         match parse_target(range)? {
+            Target::All => unreachable!(),
             Target::Cell(cell) => self.remove_style_from_cell(&cell)?,
             Target::Rect { c0, r0, c1, r1 } => self.remove_style_rect(c0, r0, c1, r1)?,
             Target::Col(c) => self.remove_style_col(c)?,
@@ -755,11 +558,12 @@ impl XlsxEditor {
         };
         let target = parse_target(range)?;
         match &target {
+            Target::All => unreachable!(),
             Target::Cell(c) => {
-                let sid = self.cell_style_id(&c)?;
+                let sid = self.cell_style_id(c)?;
                 let merged = merge_style_parts(self.read_style_parts(sid)?, &patch);
                 let style_id = self.ensure_style_from_parts(&merged)?;
-                self.apply_style_to_cell(&c, style_id)?;
+                self.apply_style_to_cell(c, style_id)?;
             }
             Target::Rect { c0, r0, c1, r1 } => {
                 self.apply_patch_rect_one_pass(*c0, *r0, *c1, *r1, &patch)?;
@@ -808,7 +612,6 @@ impl XlsxEditor {
         Ok(sid)
     }
 
-    /// Быстрый однопроходный патч диапазона: правит стиль только у существующих <c ...>.
     fn apply_patch_rect_one_pass(
         &mut self,
         c0: u32,
@@ -817,550 +620,274 @@ impl XlsxEditor {
         r1: u32,
         patch: &StyleParts,
     ) -> Result<()> {
-        let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
-        let (range_col_start, range_col_end) = if c0 <= c1 { (c0, c1) } else { (c1, c0) };
-        let (range_row_start, range_row_end) = if r0 <= r1 { (r0, r1) } else { (r1, r0) };
-        let range_width = (range_col_end - range_col_start) as usize + 1;
-        let mut coverage = vec![0u8; range_width];
-        let mut next_row_needed = range_row_start;
-
-        // забираем исходный буфер, чтобы свободно писать новый
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len() + 512);
-
-        let find_row = memmem::Finder::new(b"<row ");
-        let find_cell_open = memmem::Finder::new(b"<c ");
-        let find_cell_selfclose = memmem::Finder::new(b"<c/");
-        let find_gt = memmem::Finder::new(b">");
-
-        let mut i = 0usize;
-        let mut saw_row = false;
-
-        while let Some(off) = find_row.find(&src[i..]) {
-            saw_row = true;
-            let row_start = i + off;
-            // всё до <row ...> — как есть
-            dst.extend_from_slice(&src[i..row_start]);
-
-            // конец открывающего тега <row ...>
-            let row_tag_end =
-                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
-
-            // r="...":
-            let mut row_r: Option<u32> = None;
-            if let Some(pos) = find_bytes_from(&src, b" r=\"", row_start) {
-                if pos < row_tag_end {
-                    let v0 = pos + 4;
-                    if let Some(v1) = find_bytes_from(&src, b"\"", v0) {
-                        row_r = lexical_core::parse::<u32>(&src[v0..v1]).ok();
-                    }
-                }
-            }
-
-            // границы строки
-            let row_end =
-                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
-            let row_close_end = row_end + "</row>".len();
-
-            let Some(cur_row) = row_r else {
-                // нет номера — просто копируем как есть
-                dst.extend_from_slice(&src[row_start..row_close_end]);
-                i = row_close_end;
-                continue;
-            };
-
-            if next_row_needed <= range_row_end && cur_row > range_row_end {
-                while next_row_needed <= range_row_end {
-                    self.append_full_row_for_range(
-                        &mut dst,
-                        next_row_needed,
-                        range_col_start,
-                        range_col_end,
-                        &mut sid_cache,
-                        patch,
-                    )?;
-                    next_row_needed += 1;
-                }
-            }
-
-            if cur_row < range_row_start || cur_row > range_row_end {
-                // вне диапазона — копируем как есть
-                dst.extend_from_slice(&src[row_start..row_close_end]);
-                i = row_close_end;
-                continue;
-            }
-
-            if !coverage.is_empty() {
-                coverage.fill(0);
-            }
-            while next_row_needed < cur_row {
-                self.append_full_row_for_range(
-                    &mut dst,
-                    next_row_needed,
-                    range_col_start,
-                    range_col_end,
-                    &mut sid_cache,
-                    patch,
-                )?;
-                next_row_needed += 1;
-            }
-
-            // строка в диапазоне — копируем заголовок <row ...>
-            dst.extend_from_slice(&src[row_start..=row_tag_end]);
-
-            // обрабатываем содержимое до </row>
-            let mut j = row_tag_end + 1;
-            while j < row_end {
-                // следующий <c ...> (включая самозакрывающийся)
-                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
-                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
-                let next_cell = match (next_open, next_sc) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-
-                match next_cell {
-                    None => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) if cpos >= row_end => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) => {
-                        // всё до <c...>
-                        dst.extend_from_slice(&src[j..cpos]);
-
-                        // граница тега
-                        let tag_end = find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
-                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
-
-                        // локальная копия тега для правки атрибутов
-                        let mut cell_tag = src[cpos..=tag_end].to_vec();
-
-                        // r="A12" → проверяем колонку
-                        let mut col_idx = None;
-                        if let Some(rpos) = find_bytes_from(&cell_tag, b" r=\"", 0) {
-                            let v0 = rpos + 4;
-                            if let Some(v1) = find_bytes_from(&cell_tag, b"\"", v0) {
-                                let val = &cell_tag[v0..v1];
-                                if let Some(p) = val.iter().position(|b| b.is_ascii_digit()) {
-                                    let mut ci: u32 = 0;
-                                    for &b in &val[..p] {
-                                        let u = (b as char).to_ascii_uppercase() as u8;
-                                        ci = ci * 26 + ((u - b'A') as u32 + 1);
-                                    }
-                                    col_idx = Some(ci - 1);
-                                }
-                            }
-                        }
-
-                        let mut col_in_range = false;
-                        if let Some(ci0) = col_idx {
-                            if ci0 >= range_col_start && ci0 <= range_col_end {
-                                col_in_range = true;
-                                if !coverage.is_empty() {
-                                    coverage[(ci0 - range_col_start) as usize] = 1;
-                                }
-                            }
-                        }
-
-                        if col_in_range {
-                            // старый s=".."
-                            let old_sid = if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0)
-                            {
-                                let s0 = sp + 4;
-                                let s1 = find_bytes_from(&cell_tag, b"\"", s0 + 1)
-                                    .context("attr quote")?;
-                                lexical_core::parse::<u32>(&cell_tag[s0..s1]).ok()
-                            } else {
-                                None
-                            };
-
-                            let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
-
-                            // заменить/вставить s="..."
-                            if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
-                                let s0 = sp + 4;
-                                let s1 = find_bytes_from(&cell_tag, b"\"", s0 + 1)
-                                    .context("attr quote")?;
-                                cell_tag.splice(s0..s1, new_sid.to_string().bytes());
-                            } else {
-                                let ins = if self_closing {
-                                    cell_tag.len() - 2
-                                } else {
-                                    cell_tag.len() - 1
-                                };
-                                cell_tag.splice(ins..ins, format!(r#" s="{}""#, new_sid).bytes());
-                            }
-                        }
-
-                        // пишем тег
-                        dst.extend_from_slice(&cell_tag);
-
-                        if self_closing {
-                            j = tag_end + 1;
-                        } else {
-                            // копируем содержимое ячейки до </c>
-                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
-                                .context("</c> missing")?;
-                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
-                            j = c_close + 4;
-                        }
-                    }
-                }
-            }
-            for (offset, flag) in coverage.iter().enumerate() {
-                if *flag == 0 {
-                    let col_idx = range_col_start + offset as u32;
-                    let coord = format!("{}{}", col_letter(col_idx), cur_row);
-                    let sid = self.get_or_make_sid(&mut sid_cache, None, patch)?;
-                    let cell_tag = format!(r#"<c r="{}" s="{}"/>"#, coord, sid);
-                    dst.extend_from_slice(cell_tag.as_bytes());
-                }
-            }
-
-            // закрытие строки
-            dst.extend_from_slice(&src[row_end..row_close_end]);
-            i = row_close_end;
-
-            next_row_needed = cur_row + 1;
-        }
-
-        let mut tail_rows = Vec::new();
-        while next_row_needed <= range_row_end {
-            self.append_full_row_for_range(
-                &mut tail_rows,
-                next_row_needed,
-                range_col_start,
-                range_col_end,
-                &mut sid_cache,
-                patch,
-            )?;
-            next_row_needed += 1;
-        }
-
-        // хвост документа
-        if saw_row {
-            dst.extend_from_slice(&tail_rows);
-            dst.extend_from_slice(&src[i..]);
-        } else {
-            let sheet_data_end =
-                memmem::rfind(&src, b"</sheetData>").context("</sheetData> tag not found")?;
-            dst.extend_from_slice(&src[..sheet_data_end]);
-            dst.extend_from_slice(&tail_rows);
-            dst.extend_from_slice(&src[sheet_data_end..]);
-        }
-        self.sheet_xml = dst;
-        Ok(())
+        self.edit_style_target(&Target::Rect { c0, r0, c1, r1 }, Some(patch), None, true)
     }
-
-    fn append_full_row_for_range(
+    fn apply_patch_col_one_pass(&mut self, col: u32, row: u32, patch: &StyleParts) -> Result<()> {
+        self.edit_style_target(
+            &Target::Rect {
+                c0: col,
+                r0: row,
+                c1: col,
+                r1: crate::data::MAX_ROWS,
+            },
+            Some(patch),
+            None,
+            false,
+        )
+    }
+    fn apply_patch_row_one_pass(&mut self, row: u32, patch: &StyleParts) -> Result<()> {
+        self.edit_style_target(&Target::Row(row), Some(patch), None, false)
+    }
+    fn edit_style_target(
         &mut self,
-        dst: &mut Vec<u8>,
-        row: u32,
-        col_start: u32,
-        col_end: u32,
-        sid_cache: &mut HashMap<Option<u32>, u32>,
-        patch: &StyleParts,
+        target: &Target,
+        patch: Option<&StyleParts>,
+        fixed: Option<u32>,
+        materialize: bool,
     ) -> Result<()> {
-        let sid = self.get_or_make_sid(sid_cache, None, patch)?;
-        dst.extend_from_slice(format!(r#"<row r="{}">"#, row).as_bytes());
-        for col_idx in col_start..=col_end {
-            let coord = format!("{}{}", col_letter(col_idx), row);
-            let cell_tag = format!(r#"<c r="{}" s="{}"/>"#, coord, sid);
-            dst.extend_from_slice(cell_tag.as_bytes());
-        }
-        dst.extend_from_slice(b"</row>");
-        Ok(())
-    }
-
-    fn apply_patch_col_one_pass(
-        &mut self,
-        col0: u32,
-        row_start: u32,
-        patch: &StyleParts,
-    ) -> Result<()> {
-        let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
-        let col = col_letter(col0).to_ascii_uppercase();
-        let col_bytes = col.as_bytes();
-
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len() + 256);
-
-        let mut i = 0usize;
-        let finder = memmem::Finder::new(b"<c");
-
-        while let Some(off) = finder.find(&src[i..]) {
-            let start = i + off;
-            dst.extend_from_slice(&src[i..start]);
-
-            let next = *src.get(start + 2).unwrap_or(&b'>');
-            let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
-            let tag_end = find_bytes_from(&src, b">", start).context("cell tag end")? + 1;
-
-            if !is_cell {
-                dst.extend_from_slice(&src[start..tag_end]);
-                i = tag_end;
-                continue;
-            }
-
-            let mut cell = src[start..tag_end].to_vec();
-            let mut in_target_col = false;
-
-            if let Some(rpos) = find_bytes_from(&cell, b" r=\"", 0) {
-                let v0 = rpos + 4;
-                if let Some(v1) = find_bytes_from(&cell, b"\"", v0) {
-                    let val = &cell[v0..v1];
-                    let col_len = col_bytes.len();
-                    if val.len() > col_len
-                        && val[..col_len]
-                            .iter()
-                            .map(|b| b.to_ascii_uppercase())
-                            .eq(col_bytes.iter().copied())
-                        && val[col_len..].iter().all(|b| b.is_ascii_digit())
-                    {
-                        if let Ok(row_num) = lexical_core::parse::<u32>(&val[col_len..]) {
-                            if row_num >= row_start {
-                                in_target_col = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if in_target_col {
-                let old_sid = if let Some(sp) = find_bytes_from(&cell, b" s=\"", 0) {
-                    let s0 = sp + 4;
-                    let s1 = find_bytes_from(&cell, b"\"", s0 + 1).context("style quote")?;
-                    lexical_core::parse::<u32>(&cell[s0..s1]).ok()
-                } else {
-                    None
-                };
-                let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
-
-                if let Some(sp) = find_bytes_from(&cell, b" s=\"", 0) {
-                    let s0 = sp + 4;
-                    let s1 = find_bytes_from(&cell, b"\"", s0 + 1).context("style quote")?;
-                    cell.splice(s0..s1, new_sid.to_string().bytes());
-                } else {
-                    let ins = if cell.len() >= 2 && cell[cell.len() - 2] == b'/' {
-                        cell.len() - 2
-                    } else {
-                        cell.len() - 1
-                    };
-                    cell.splice(ins..ins, format!(r#" s="{}""#, new_sid).bytes());
-                }
-            }
-
-            dst.extend_from_slice(&cell);
-            i = tag_end;
-        }
-
-        dst.extend_from_slice(&src[i..]);
-        self.sheet_xml = dst;
-        Ok(())
-    }
-
-    fn apply_patch_row_one_pass(&mut self, row_target: u32, patch: &StyleParts) -> Result<()> {
-        let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
-
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len() + 256);
-
-        let find_row = memmem::Finder::new(b"<row ");
-        let find_gt = memmem::Finder::new(b">");
-        let find_cell_open = memmem::Finder::new(b"<c ");
-        let find_cell_selfclose = memmem::Finder::new(b"<c/");
-
-        let mut i = 0usize;
-        while let Some(off) = find_row.find(&src[i..]) {
-            let row_start = i + off;
-            dst.extend_from_slice(&src[i..row_start]);
-
-            let row_tag_end =
-                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
-            let row_end =
-                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
-            let row_close_end = row_end + "</row>".len();
-
-            let mut row_r: Option<u32> = None;
-            if let Some(pos) = find_bytes_from(&src, b" r=\"", row_start) {
-                if pos < row_tag_end {
-                    let v0 = pos + 4;
-                    if let Some(v1) = find_bytes_from(&src, b"\"", v0) {
-                        row_r = lexical_core::parse::<u32>(&src[v0..v1]).ok();
-                    }
-                }
-            }
-
-            if row_r != Some(row_target) {
-                dst.extend_from_slice(&src[row_start..row_close_end]);
-                i = row_close_end;
-                continue;
-            }
-
-            dst.extend_from_slice(&src[row_start..=row_tag_end]);
-
-            let mut j = row_tag_end + 1;
-            while j < row_end {
-                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
-                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
-                let next_cell = match (next_open, next_sc) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-
-                match next_cell {
-                    None => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) if cpos >= row_end => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) => {
-                        dst.extend_from_slice(&src[j..cpos]);
-
-                        let tag_end = find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
-                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
-                        let mut cell_tag = src[cpos..=tag_end].to_vec();
-
-                        let old_sid = if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
-                            let s0 = sp + 4;
-                            let s1 =
-                                find_bytes_from(&cell_tag, b"\"", s0 + 1).context("style quote")?;
-                            lexical_core::parse::<u32>(&cell_tag[s0..s1]).ok()
-                        } else {
-                            None
-                        };
-                        let new_sid = self.get_or_make_sid(&mut sid_cache, old_sid, patch)?;
-
-                        if let Some(sp) = find_bytes_from(&cell_tag, b" s=\"", 0) {
-                            let s0 = sp + 4;
-                            let s1 =
-                                find_bytes_from(&cell_tag, b"\"", s0 + 1).context("style quote")?;
-                            cell_tag.splice(s0..s1, new_sid.to_string().bytes());
-                        } else {
-                            let ins = if self_closing {
-                                cell_tag.len() - 2
-                            } else {
-                                cell_tag.len() - 1
-                            };
-                            cell_tag.splice(ins..ins, format!(r#" s="{}""#, new_sid).bytes());
-                        }
-
-                        dst.extend_from_slice(&cell_tag);
-
-                        if self_closing {
-                            j = tag_end + 1;
-                        } else {
-                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
-                                .context("</c> missing")?;
-                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
-                            j = c_close + 4;
-                        }
-                    }
-                }
-            }
-
-            dst.extend_from_slice(&src[row_end..row_close_end]);
-            i = row_close_end;
-        }
-
-        dst.extend_from_slice(&src[i..]);
-        self.sheet_xml = dst;
-        Ok(())
-    }
-
-    fn convert_target_cells_to_inline_text(&mut self, target: &Target) -> Result<()> {
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len());
-
-        let finder = memmem::Finder::new(b"<c");
-        let mut i = 0usize;
-
-        while let Some(off) = finder.find(&src[i..]) {
-            let cpos = i + off;
-            dst.extend_from_slice(&src[i..cpos]);
-
-            let next = *src.get(cpos + 2).unwrap_or(&b'>');
-            let is_cell = matches!(next, b' ' | b'>' | b'/' | b'r' | b's' | b't');
-            let Some(tag_end) = find_bytes_from(&src, b">", cpos) else {
-                dst.extend_from_slice(&src[cpos..]);
-                self.sheet_xml = dst;
-                return Ok(());
-            };
-
-            if !is_cell {
-                dst.extend_from_slice(&src[cpos..=tag_end]);
-                i = tag_end + 1;
-                continue;
-            }
-
-            let self_closing = tag_end > cpos && src[tag_end - 1] == b'/';
-            if self_closing {
-                dst.extend_from_slice(&src[cpos..=tag_end]);
-                i = tag_end + 1;
-                continue;
-            }
-
-            let cell_end = find_bytes_from(&src, b"</c>", tag_end + 1)
-                .context("</c> missing while converting text format")?
-                + "</c>".len();
-            let cell = &src[cpos..cell_end];
-            let tag = &src[cpos..=tag_end];
-
-            if !cell_target_matches(tag, target) || !cell_type_is_numeric_or_default(tag) {
-                dst.extend_from_slice(cell);
-                i = cell_end;
-                continue;
-            }
-            if memmem::find(cell, b"<f").is_some() || memmem::find(cell, b"<is").is_some() {
-                dst.extend_from_slice(cell);
-                i = cell_end;
-                continue;
-            }
-
-            let Some(v_start_rel) = memmem::find(cell, b"<v>") else {
-                dst.extend_from_slice(cell);
-                i = cell_end;
-                continue;
-            };
-            let value_start = v_start_rel + "<v>".len();
-            let Some(v_end_rel) = memmem::find(&cell[value_start..], b"</v>") else {
-                dst.extend_from_slice(cell);
-                i = cell_end;
-                continue;
-            };
-            let value_end = value_start + v_end_rel;
-            let value = std::str::from_utf8(&cell[value_start..value_end])
-                .context("cell value is not UTF-8")?;
-
-            let mut new_tag = remove_attr_from_tag(tag, b"t");
-            insert_attr_before_tag_end(&mut new_tag, r#" t="inlineStr""#);
-            dst.extend_from_slice(&new_tag);
-            dst.extend_from_slice(b"<is>");
-            if needs_xml_space_preserve(value) {
-                dst.extend_from_slice(b"<t xml:space=\"preserve\">");
+        let mut cache = HashMap::new();
+        self.transform_cells(target, materialize, |editor, cell, _col, _row| {
+            let old = cell.attr("s")?.map(|v| v.parse::<u32>()).transpose()?;
+            let sid = if let Some(patch) = patch {
+                Some(editor.get_or_make_sid(&mut cache, old, patch)?)
             } else {
-                dst.extend_from_slice(b"<t>");
+                fixed
+            };
+            let value = sid.map(|v| v.to_string());
+            if old == sid {
+                return Ok(None);
             }
-            dst.extend_from_slice(xml_text_escape(value).as_bytes());
-            dst.extend_from_slice(b"</t></is></c>");
-
-            i = cell_end;
+            let opening = cell.set_attr("s", value.as_deref())?;
+            Ok(Some(crate::xml::patch_opening(cell, &opening)))
+        })
+    }
+    fn transform_cells<F>(
+        &mut self,
+        target: &Target,
+        materialize: bool,
+        mut transform: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Self, &crate::xml::Element<'_>, usize, u32) -> Result<Option<Vec<u8>>>,
+    {
+        let src = self.sheet_xml.clone();
+        let data = crate::xml::require(&src, "sheetData")?;
+        let rect = if materialize {
+            match target {
+                Target::Cell(c) => {
+                    let (col, row) = crate::data::parse_coord(c)?;
+                    Some((col as u32, row, col as u32, row))
+                }
+                Target::Rect { c0, r0, c1, r1 } => Some((
+                    (*c0).min(*c1),
+                    (*r0).min(*r1),
+                    (*c0).max(*c1),
+                    (*r0).max(*r1),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut content = crate::xml::begin_content(&src, &data)?;
+        let mut next = rect.map(|(_, row, _, _)| row);
+        let mut changed = false;
+        for row in data.children() {
+            let row = row?;
+            anyhow::ensure!(
+                row.is("row", crate::xml::SHEET_NS),
+                "Unexpected element in sheetData"
+            );
+            let number: u32 = row.attr("r")?.context("Row number missing")?.parse()?;
+            if let Some((_, _, _, last)) = rect {
+                while next.is_some_and(|n| n < number && n <= last) {
+                    let n = next.unwrap();
+                    let empty = format!(
+                        r#"<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" r="{n}"></row>"#
+                    );
+                    let element = crate::xml::root_in_context(empty.as_bytes(), &data)?;
+                    content.extend_from_slice(
+                        &self
+                            .transform_row(&element, n, target, rect, &mut transform)?
+                            .unwrap_or_else(|| empty.as_bytes().to_vec()),
+                    );
+                    next = Some(n + 1);
+                    changed = true;
+                }
+            }
+            if let Some(updated) = self.transform_row(&row, number, target, rect, &mut transform)? {
+                content.extend_from_slice(&updated);
+                changed = true;
+            } else {
+                content.extend_from_slice(row.bytes());
+            }
+            if next.is_some_and(|n| n <= number) {
+                next = Some(number + 1);
+            }
         }
-
-        dst.extend_from_slice(&src[i..]);
-        self.sheet_xml = dst;
+        if let Some((_, _, _, last)) = rect {
+            while next.is_some_and(|n| n <= last) {
+                let n = next.unwrap();
+                let empty = format!(
+                    r#"<row xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" r="{n}"></row>"#
+                );
+                let element = crate::xml::root_in_context(empty.as_bytes(), &data)?;
+                content.extend_from_slice(
+                    &self
+                        .transform_row(&element, n, target, rect, &mut transform)?
+                        .unwrap_or_else(|| empty.as_bytes().to_vec()),
+                );
+                next = Some(n + 1);
+                changed = true;
+            }
+        }
+        if changed {
+            crate::xml::end_content(&src, &data, &mut content)?;
+            self.sheet_xml = content.into();
+            self.sheet_data_end = None;
+            self.row_index = None;
+            if let Some((_, _, column, last)) = rect {
+                self.last_row = self.last_row.max(last);
+                if let Some((columns, rows)) = self.dimensions.get(&self.sheet_path).copied() {
+                    self.dimensions.insert(
+                        self.sheet_path.clone(),
+                        (columns.max(column as usize + 1), rows.max(last)),
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+    fn transform_row<F>(
+        &mut self,
+        row: &crate::xml::Element<'_>,
+        number: u32,
+        target: &Target,
+        rect: Option<(u32, u32, u32, u32)>,
+        transform: &mut F,
+    ) -> Result<Option<Vec<u8>>>
+    where
+        F: FnMut(&mut Self, &crate::xml::Element<'_>, usize, u32) -> Result<Option<Vec<u8>>>,
+    {
+        let row_matches = match target {
+            Target::Cell(coord) => crate::data::parse_coord(coord)?.1 == number,
+            Target::Rect { r0, r1, .. } => number >= (*r0).min(*r1) && number <= (*r0).max(*r1),
+            Target::Row(row) => *row == number,
+            _ => true,
+        };
+        if !row_matches {
+            return Ok(None);
+        }
+        if rect.is_none() {
+            let mut result: Option<Vec<u8>> = None;
+            let mut cursor = row.content.start;
+            for cell in row.children() {
+                let cell = cell?;
+                if !cell.is("c", crate::xml::SHEET_NS) {
+                    continue;
+                }
+                let coord = cell.attr("r")?.context("Cell coordinate missing")?;
+                let (col, cell_row) = crate::data::parse_coord(&coord)?;
+                anyhow::ensure!(cell_row == number, "Cell/row coordinate mismatch");
+                if target.matches(col as u32, number)
+                    && let Some(replacement) = transform(self, &cell, col, number)?
+                {
+                    let result = result.get_or_insert_with(|| Vec::with_capacity(row.full.len()));
+                    result.extend_from_slice(row.segment(cursor..cell.full.start));
+                    result.extend_from_slice(&replacement);
+                    cursor = cell.full.end;
+                }
+            }
+            return match result {
+                Some(mut content) => {
+                    content.extend_from_slice(row.segment(cursor..row.content.end));
+                    Ok(Some(row.with_content(&content)?))
+                }
+                None => Ok(None),
+            };
+        }
+        let mut cells = std::collections::BTreeMap::new();
+        let mut others = Vec::new();
+        for cell in row.children() {
+            let cell = cell?;
+            if cell.is("c", crate::xml::SHEET_NS) {
+                let coord = cell.attr("r")?.context("Cell coordinate missing")?;
+                let (col, cell_row) = crate::data::parse_coord(&coord)?;
+                anyhow::ensure!(cell_row == number, "Cell/row coordinate mismatch");
+                anyhow::ensure!(
+                    cells.insert(col as u32, cell).is_none(),
+                    "Duplicate cell coordinate"
+                );
+            } else {
+                others.push(cell);
+            }
+        }
+        let fill = rect
+            .filter(|(_, r0, _, r1)| number >= *r0 && number <= *r1)
+            .map(|(c0, _, c1, _)| c0..=c1);
+        let mut missing = Vec::new();
+        if let Some(fill) = fill {
+            for col in fill {
+                if !cells.contains_key(&col) {
+                    missing.push(col);
+                }
+            }
+        }
+        let mut generated = Vec::with_capacity(missing.len());
+        for col in missing {
+            let tag = format!(r#"<c r="{}{number}"/>"#, col_letter(col));
+            generated.push((
+                col,
+                crate::xml::child_fragment(row, tag.as_bytes())?.into_owned(),
+            ));
+        }
+        for (col, bytes) in &generated {
+            cells.insert(*col, crate::xml::root_in_context(bytes, row)?);
+        }
+        let mut content = Vec::new();
+        let mut changed = !generated.is_empty();
+        for (col, cell) in cells {
+            if target.matches(col, number)
+                && let Some(replacement) = transform(self, &cell, col as usize, number)?
+            {
+                content.extend_from_slice(&replacement);
+                changed = true;
+                continue;
+            }
+            content.extend_from_slice(cell.bytes());
+        }
+        if !changed {
+            return Ok(None);
+        }
+        for other in others {
+            content.extend_from_slice(other.bytes());
+        }
+        Ok(Some(row.with_content(&content)?))
+    }
+    fn convert_target_cells_to_inline_text(&mut self, target: &Target) -> Result<()> {
+        self.transform_cells(target, false, |_, cell, _col, _row| {
+            if !matches!(cell.attr("t")?.as_deref(), None | Some("n")) || cell.child("f")?.is_some()
+            {
+                return Ok(None);
+            }
+            let Some(value) = cell.child("v")? else {
+                return Ok(None);
+            };
+            let text = crate::xml::text(&value)?;
+            let mut writer = quick_xml::Writer::new(Vec::new());
+            writer.create_element("is").write_inner_content(|w| {
+                let mut t = w.create_element("t");
+                if needs_xml_space_preserve(&text) {
+                    t = t.with_attribute(("xml:space", "preserve"));
+                }
+                t.write_text_content(quick_xml::events::BytesText::new(&text))?;
+                Ok(())
+            })?;
+            let replacement = cell.with_content(&writer.into_inner())?;
+            let element = crate::xml::root(&replacement)?;
+            let tag = element.set_attr("t", Some("inlineStr"))?;
+            Ok(Some(crate::xml::patch_opening(&element, &tag)))
+        })
     }
 }
 
@@ -1369,6 +896,7 @@ impl XlsxEditor {
         let mut sid_cache: HashMap<Option<u32>, u32> = HashMap::new();
 
         match parse_target(range)? {
+            Target::All => unreachable!(),
             Target::Cell(cell) => {
                 let sid = self.cell_style_id(&cell)?;
                 let new_sid = self.get_or_make_sid(&mut sid_cache, sid, &patch)?;
@@ -1416,6 +944,7 @@ impl XlsxEditor {
         };
 
         Ok(StyleParts {
+            num_fmt_id: Some(num_fmt_id),
             num_fmt_code,
             font: font_id,
             fill: fill_id,
@@ -1431,7 +960,7 @@ impl XlsxEditor {
         let num_fmt_id = if let Some(code) = parts.num_fmt_code.as_deref() {
             self.ensure_num_fmt(code)?
         } else {
-            0
+            parts.num_fmt_id.unwrap_or(0)
         };
 
         let font_id = parts.font;
@@ -1535,10 +1064,9 @@ impl XlsxEditor {
             xf.push_str("/>");
         }
 
-        let pos = memmem::rfind(&self.styles_xml, b"</cellXfs>")
-            .context("styles.xml: </cellXfs> not found")?;
-        self.styles_xml.splice(pos..pos, xf.bytes());
-        bump_count(&mut self.styles_xml, b"<cellXfs", b"count=\"")?;
+        self.styles_xml =
+            crate::xml::append_child(&self.styles_xml, "cellXfs", xf.as_bytes())?.into();
+        crate::xml::bump_count(&mut self.styles_xml, "cellXfs")?;
 
         // индекс нового — это текущее количество <xf> до вставки
         let sid = {
@@ -1549,25 +1077,6 @@ impl XlsxEditor {
         Ok(sid)
     }
 }
-// impl XlsxEditor {
-//     fn cell_exists(&self, coord: &str) -> bool {
-//         let tag = format!(r#"<c r="{coord}""#);
-//         memmem::find(&self.sheet_xml, tag.as_bytes()).is_some()
-//     }
-
-//     fn ensure_rect_cells_exist(&mut self, c0: u32, r0: u32, c1: u32, r1: u32) -> Result<()> {
-//         for r in r0..=r1 {
-//             for c in c0..=c1 {
-//                 let coord = format!("{}{}", col_letter(c), r);
-//                 if !self.cell_exists(&coord) {
-//                     // создаём ячейку (apply_style_to_cell сам создаст row/cell при отсутствии)
-//                     self.apply_style_to_cell(&coord, 0)?;
-//                 }
-//             }
-//         }
-//         Ok(())
-//     }
-// }
 
 fn merge_align(base: Option<AlignSpec>, patch: Option<AlignSpec>) -> Option<AlignSpec> {
     match (base, patch) {
@@ -1593,6 +1102,7 @@ fn merge_style_parts(mut base: StyleParts, patch: &StyleParts) -> StyleParts {
 
     if patch.num_fmt_code.is_some() {
         base.num_fmt_code = patch.num_fmt_code.clone();
+        base.num_fmt_id = None;
     }
     if patch.font.is_some() {
         base.font = patch.font;
@@ -1609,7 +1119,7 @@ fn merge_style_parts(mut base: StyleParts, patch: &StyleParts) -> StyleParts {
     base
 }
 
-fn builtin_num_fmt_id(code: &str) -> Option<u32> {
+pub(crate) fn builtin_num_fmt_id(code: &str) -> Option<u32> {
     match code {
         "General" => Some(0),
         "0" => Some(1),
@@ -1642,78 +1152,6 @@ fn seed_builtin_num_fmts(ix: &mut StyleIndex) {
             .or_insert_with(|| code.to_string());
     }
 }
-
-fn cell_target_matches(cell_tag: &[u8], target: &Target) -> bool {
-    let Some(coord) = cell_coord(cell_tag) else {
-        return false;
-    };
-    let (col, row) = split_coord(&coord);
-    match target {
-        Target::Cell(c) => c.eq_ignore_ascii_case(&coord),
-        Target::Rect { c0, r0, c1, r1 } => {
-            let min_c = (*c0).min(*c1);
-            let max_c = (*c0).max(*c1);
-            let min_r = (*r0).min(*r1);
-            let max_r = (*r0).max(*r1);
-            col >= min_c && col <= max_c && row >= min_r && row <= max_r
-        }
-        Target::Col(c) => col == *c,
-        Target::Row(r) => row == *r,
-    }
-}
-
-fn cell_coord(cell_tag: &[u8]) -> Option<String> {
-    let rpos = find_bytes_from(cell_tag, b" r=\"", 0)?;
-    let start = rpos + 4;
-    let end = find_bytes_from(cell_tag, b"\"", start)?;
-    Some(String::from_utf8_lossy(&cell_tag[start..end]).into_owned())
-}
-
-fn cell_type_is_numeric_or_default(cell_tag: &[u8]) -> bool {
-    let Some(tpos) = find_bytes_from(cell_tag, b" t=\"", 0) else {
-        return true;
-    };
-    let start = tpos + 4;
-    let Some(end) = find_bytes_from(cell_tag, b"\"", start) else {
-        return false;
-    };
-    &cell_tag[start..end] == b"n"
-}
-
-fn remove_attr_from_tag(tag: &[u8], attr: &[u8]) -> Vec<u8> {
-    let mut out = tag.to_vec();
-    let mut needle = Vec::with_capacity(attr.len() + 3);
-    needle.extend_from_slice(b" ");
-    needle.extend_from_slice(attr);
-    needle.extend_from_slice(b"=\"");
-
-    while let Some(pos) = memmem::find(&out, &needle) {
-        let value_start = pos + needle.len();
-        let Some(value_end) = find_bytes_from(&out, b"\"", value_start) else {
-            break;
-        };
-        out.drain(pos..value_end + 1);
-    }
-    out
-}
-
-fn insert_attr_before_tag_end(tag: &mut Vec<u8>, attr: &str) {
-    let insert_at = if tag.len() >= 2 && tag[tag.len() - 2] == b'/' {
-        tag.len() - 2
-    } else {
-        tag.len() - 1
-    };
-    tag.splice(insert_at..insert_at, attr.bytes());
-}
-
-fn xml_text_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/* ========================== LOW-LEVEL HELPERS ============================= */
 
 impl XlsxEditor {
     fn ensure_num_fmt(&mut self, code: &str) -> Result<u32> {
@@ -1748,26 +1186,19 @@ impl XlsxEditor {
         // C) правим XML
         let escaped_code = quick_xml::escape::escape(code);
         let tag = format!(r#"<numFmt numFmtId="{new_id}" formatCode="{escaped_code}"/>"#);
-        if let Some(end) = memmem::rfind(&self.styles_xml, b"</numFmts>") {
-            // блок уже есть → просто дописываем внутрь и бампим count
-            self.styles_xml.splice(end..end, tag.bytes());
-            bump_count(&mut self.styles_xml, b"<numFmts", b"count=\"")?;
+        let root = crate::xml::root(&self.styles_xml)?;
+        if root.child("numFmts")?.is_some() {
+            self.styles_xml =
+                crate::xml::append_child(&self.styles_xml, "numFmts", tag.as_bytes())?.into();
+            crate::xml::bump_count(&mut self.styles_xml, "numFmts")?;
         } else {
-            // блока нет → создаём РОВНО один
-            let root = memmem::find(&self.styles_xml, b"<styleSheet")
-                .context("<styleSheet> root not found in styles.xml")?;
-            let after_root = find_bytes_from(&self.styles_xml, b">", root)
-                .context("<styleSheet> start tag '>' not found")?
-                + 1;
-
-            // старайся соблюдать порядок: numFmts должен стоять до <fonts>
-            let before_fonts = memmem::find(&self.styles_xml, b"<fonts").unwrap_or(after_root);
-
+            let before = root
+                .child("fonts")?
+                .map(|e| e.full.start)
+                .unwrap_or(root.content.start);
             let block = format!(r#"<numFmts count="1">{tag}</numFmts>"#);
-            self.styles_xml
-                .splice(before_fonts..before_fonts, block.bytes());
-
-            // ← ВАЖНО: НЕ делать вторую вставку по insert..insert
+            let block = crate::xml::child_fragment(&root, block.as_bytes())?.into_owned();
+            self.styles_xml.splice(before..before, block);
         }
         // D) обновляем индекс
         {
@@ -1810,8 +1241,6 @@ impl XlsxEditor {
         };
 
         // 2) XML
-        let insert = memmem::rfind(&self.styles_xml, b"</fonts>")
-            .context("<fonts> block not found in styles.xml")?;
         let mut xml = String::from("<font>");
         if bold {
             xml.push_str("<b/>");
@@ -1825,8 +1254,9 @@ impl XlsxEditor {
             quick_xml::escape::escape(name)
         ));
         xml.push_str("</font>");
-        self.styles_xml.splice(insert..insert, xml.bytes());
-        bump_count(&mut self.styles_xml, b"<fonts", b"count=\"")?;
+        self.styles_xml =
+            crate::xml::append_child(&self.styles_xml, "fonts", xml.as_bytes())?.into();
+        crate::xml::bump_count(&mut self.styles_xml, "fonts")?;
 
         // 3) индекс
         {
@@ -1860,13 +1290,12 @@ impl XlsxEditor {
         };
 
         // 2) XML
-        let insert = memmem::rfind(&self.styles_xml, b"</fills>")
-            .context("<fills> block not found in styles.xml")?;
         let xml = format!(
             r#"<fill><patternFill patternType="solid"><fgColor rgb="{key}"/><bgColor indexed="64"/></patternFill></fill>"#
         );
-        self.styles_xml.splice(insert..insert, xml.bytes());
-        bump_count(&mut self.styles_xml, b"<fills", b"count=\"")?;
+        self.styles_xml =
+            crate::xml::append_child(&self.styles_xml, "fills", xml.as_bytes())?.into();
+        crate::xml::bump_count(&mut self.styles_xml, "fills")?;
 
         // 3) индекс
         {
@@ -1898,14 +1327,13 @@ impl XlsxEditor {
         };
 
         // 2) Вставляем XML
-        let end_pos = memmem::rfind(&self.styles_xml, b"</borders>")
-            .context("styles.xml: </borders> not found")?;
         let tag = format!(
             r#"<border><left style="{s}"/><right style="{s}"/><top style="{s}"/><bottom style="{s}"/><diagonal/></border>"#,
             s = style
         );
-        self.styles_xml.splice(end_pos..end_pos, tag.bytes());
-        bump_count(&mut self.styles_xml, b"<borders", b"count=\"")?;
+        self.styles_xml =
+            crate::xml::append_child(&self.styles_xml, "borders", tag.as_bytes())?.into();
+        crate::xml::bump_count(&mut self.styles_xml, "borders")?;
 
         // 3) Обновляем индекс ПОСЛЕ вставки, используя pre‑id
         {
@@ -1918,328 +1346,54 @@ impl XlsxEditor {
     }
 
     pub(crate) fn cell_style_id(&self, coord: &str) -> Result<Option<u32>> {
-        let tag = format!(r#"<c r="{coord}""#);
-        if let Some(pos) = memmem::rfind(&self.sheet_xml, tag.as_bytes()) {
-            if let Some(spos) = find_bytes_from(&self.sheet_xml, b" s=\"", pos) {
-                let val_start = spos + 4;
-                let val_end =
-                    find_bytes_from(&self.sheet_xml, b"\"", val_start + 1).unwrap_or(val_start);
-                let id = std::str::from_utf8(&self.sheet_xml[val_start..val_end])?
-                    .parse::<u32>()
-                    .unwrap_or(0);
-                return Ok(Some(id));
+        let (col, number) = crate::data::parse_coord(coord)?;
+        let data = crate::xml::require(&self.sheet_xml, "sheetData")?;
+        for row in data.children() {
+            let row = row?;
+            if row
+                .attr("r")?
+                .as_deref()
+                .and_then(|s| s.parse::<u32>().ok())
+                != Some(number)
+            {
+                continue;
+            }
+            for cell in row.children() {
+                let cell = cell?;
+                if !cell.is("c", crate::xml::SHEET_NS) {
+                    continue;
+                }
+                if let Some(address) = cell.attr("r")?
+                    && crate::data::parse_coord(&address)? == (col, number)
+                {
+                    return Ok(cell.attr("s")?.map(|s| s.parse()).transpose()?);
+                }
             }
         }
         Ok(None)
     }
-
     fn apply_style_to_cell(&mut self, coord: &str, style: u32) -> Result<()> {
-        let row_num = coord.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-        let row_tag = format!(r#"<row r="{row_num}""#);
-
-        let row_pos = match memmem::rfind(&self.sheet_xml, row_tag.as_bytes()) {
-            Some(p) => p,
-            None => {
-                self.set_cell(coord, "")?;
-                return self.apply_style_to_cell(coord, style);
-            }
-        };
-
-        let row_end =
-            find_bytes_from(&self.sheet_xml, b"</row>", row_pos).context("</row> not found")?;
-
-        let cell_tag = format!(r#"<c r="{coord}""#);
-        let cpos = match find_bytes_from(&self.sheet_xml, cell_tag.as_bytes(), row_pos) {
-            Some(p) => p,
-            None => {
-                let new_cell = format!(r#"<c r="{coord}" s="{style}"/>"#);
-                self.sheet_xml.splice(row_end..row_end, new_cell.bytes());
-                return Ok(());
-            }
-        };
-
-        let ctag_end = find_bytes_from(&self.sheet_xml, b">", cpos).context("malformed <c> tag")?;
-
-        if let Some(sattr) = find_bytes_from(&self.sheet_xml, b" s=\"", cpos) {
-            if sattr < ctag_end {
-                let val_start = sattr + 4;
-                let val_end = find_bytes_from(&self.sheet_xml, b"\"", val_start + 1)
-                    .context("attr closing '\"' not found")?;
-                self.sheet_xml
-                    .splice(val_start..val_end, style.to_string().bytes());
-                return Ok(());
-            }
-        }
-        self.sheet_xml
-            .splice(ctag_end..ctag_end, format!(r#" s="{style}""#).bytes());
-        Ok(())
+        self.edit_style_target(&Target::Cell(coord.to_owned()), None, Some(style), true)
     }
-
     fn remove_style_from_cell(&mut self, coord: &str) -> Result<()> {
-        let row_start = coord
-            .find(|c: char| c.is_ascii_digit())
-            .context("invalid cell coordinate – no digits")?;
-        let row_num = &coord[row_start..];
-        let row_tag = format!(r#"<row r="{row_num}""#);
-
-        let Some(row_pos) = memmem::rfind(&self.sheet_xml, row_tag.as_bytes()) else {
-            return Ok(());
-        };
-
-        let row_end =
-            find_bytes_from(&self.sheet_xml, b"</row>", row_pos).context("</row> not found")?;
-
-        let cell_tag = format!(r#"<c r="{coord}""#);
-        let Some(cpos) = find_bytes_from(&self.sheet_xml, cell_tag.as_bytes(), row_pos) else {
-            return Ok(());
-        };
-        if cpos >= row_end {
-            return Ok(());
-        }
-
-        let ctag_end = find_bytes_from(&self.sheet_xml, b">", cpos).context("malformed <c> tag")?;
-
-        if let Some(sattr) = find_bytes_from(&self.sheet_xml, b" s=\"", cpos) {
-            if sattr < ctag_end {
-                let val_end = find_bytes_from(&self.sheet_xml, b"\"", sattr + 4)
-                    .context("style attribute not closed")?;
-                let remove_end = val_end + 1;
-                self.sheet_xml.drain(sattr..remove_end);
-            }
-        }
-        Ok(())
+        self.edit_style_target(&Target::Cell(coord.to_owned()), None, None, false)
     }
-
     fn remove_style_rect(&mut self, c0: u32, r0: u32, c1: u32, r1: u32) -> Result<()> {
-        let (col_start, col_end) = if c0 <= c1 { (c0, c1) } else { (c1, c0) };
-        let (row_start, row_end) = if r0 <= r1 { (r0, r1) } else { (r1, r0) };
-
-        for r in row_start..=row_end {
-            for c in col_start..=col_end {
-                let coord = format!("{}{}", col_letter(c), r);
-                self.remove_style_from_cell(&coord)?;
-            }
-        }
-        Ok(())
+        self.edit_style_target(&Target::Rect { c0, r0, c1, r1 }, None, None, false)
     }
-}
-
-impl XlsxEditor {
-    /// Удалить стиль из всех ячеек указанной строки (row-level syntax: "12:").
     fn remove_style_row(&mut self, row: u32) -> Result<()> {
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len());
-
-        let find_row = memmem::Finder::new(b"<row ");
-        let find_gt = memmem::Finder::new(b">");
-        let find_cell_open = memmem::Finder::new(b"<c ");
-        let find_cell_selfclose = memmem::Finder::new(b"<c/");
-
-        let mut i = 0usize;
-
-        while let Some(off) = find_row.find(&src[i..]) {
-            let row_start = i + off;
-            // всё до <row ...> — как есть
-            dst.extend_from_slice(&src[i..row_start]);
-
-            // конец открывающего тега <row ...>
-            let row_tag_end =
-                find_gt.find(&src[row_start..]).context("malformed <row>")? + row_start;
-
-            // r="..."
-            let mut row_r: Option<u32> = None;
-            if let Some(pos) = find_bytes_from(&src, b" r=\"", row_start) {
-                if pos < row_tag_end {
-                    let v0 = pos + 4;
-                    if let Some(v1) = find_bytes_from(&src, b"\"", v0) {
-                        row_r = lexical_core::parse::<u32>(&src[v0..v1]).ok();
-                    }
-                }
-            }
-
-            let row_end =
-                find_bytes_from(&src, b"</row>", row_tag_end).context("</row> not found")?;
-            let row_close_end = row_end + "</row>".len();
-
-            let Some(cur_row) = row_r else {
-                // без номера — просто копируем
-                dst.extend_from_slice(&src[row_start..row_close_end]);
-                i = row_close_end;
-                continue;
-            };
-
-            if cur_row != row {
-                // чужая строка — копируем как есть
-                dst.extend_from_slice(&src[row_start..row_close_end]);
-                i = row_close_end;
-                continue;
-            }
-
-            // Это наша строка → копируем заголовок <row ...>
-            dst.extend_from_slice(&src[row_start..=row_tag_end]);
-
-            // Обрабатываем содержимое до </row>, вычищая s="..."
-            let mut j = row_tag_end + 1;
-            while j < row_end {
-                let next_open = find_cell_open.find(&src[j..]).map(|p| j + p);
-                let next_sc = find_cell_selfclose.find(&src[j..]).map(|p| j + p);
-                let next_cell = match (next_open, next_sc) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-
-                match next_cell {
-                    None => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) if cpos >= row_end => {
-                        dst.extend_from_slice(&src[j..row_end]);
-                        break;
-                    }
-                    Some(cpos) => {
-                        // всё до <c ...>
-                        dst.extend_from_slice(&src[j..cpos]);
-
-                        let tag_end = find_gt.find(&src[cpos..]).context("cell tag end")? + cpos;
-                        let self_closing = tag_end >= 1 && src[tag_end - 1] == b'/';
-
-                        let mut cell_tag = src[cpos..=tag_end].to_vec();
-
-                        // внутри тега убираем атрибут s="..."
-                        if let Some(sattr) = find_bytes_from(&cell_tag, b" s=\"", 0) {
-                            // ищем закрывающую кавычку
-                            if let Some(val_end) = find_bytes_from(&cell_tag, b"\"", sattr + 4) {
-                                // удаляем s="...": до включая кавычку
-                                let remove_end = val_end + 1;
-                                cell_tag.drain(sattr..remove_end);
-                            }
-                        }
-
-                        dst.extend_from_slice(&cell_tag);
-
-                        if self_closing {
-                            j = tag_end + 1;
-                        } else {
-                            // содержимое ячейки до </c> — просто копируем
-                            let c_close = find_bytes_from(&src, b"</c>", tag_end + 1)
-                                .context("</c> missing")?;
-                            dst.extend_from_slice(&src[tag_end + 1..=c_close + 3]);
-                            j = c_close + 4;
-                        }
-                    }
-                }
-            }
-
-            // закрытие строки
-            dst.extend_from_slice(&src[row_end..row_close_end]);
-            i = row_close_end;
-        }
-
-        // хвост (после последней строки)
-        dst.extend_from_slice(&src[i..]);
-
-        self.sheet_xml = dst;
-        Ok(())
+        self.edit_style_target(&Target::Row(row), None, None, false)
     }
-}
-
-impl XlsxEditor {
-    /// Удалить стиль из всех ячеек указанного столбца (col-level syntax: "A:", "C:").
-    /// col0 — 0-based индекс столбца.
-    fn remove_style_col(&mut self, col0: u32) -> Result<()> {
-        // Имя столбца в Excel-нотации ("A", "G", "AA", ...)
-        let col = col_letter(col0);
-        // Ищем атрибуты r="G...", r="AA..." и т.п.
-        let pattern = format!(r#" r="{}"#, col);
-        let pat = pattern.as_bytes();
-
-        let src = std::mem::take(&mut self.sheet_xml);
-        let mut dst = Vec::with_capacity(src.len());
-
-        let finder = memmem::Finder::new(pat);
-
-        let mut i: usize = 0;
-
-        while let Some(off) = finder.find(&src[i..]) {
-            let p = i + off; // позиция начала ` r="COL`
-
-            // После r="COL" сразу должна идти цифра → иначе это не наш столбец
-            let row_start_idx = p + pat.len();
-            if row_start_idx >= src.len() || !src[row_start_idx].is_ascii_digit() {
-                // Ложное совпадение (например, r="GA12" при col="A")
-                dst.extend_from_slice(&src[i..=p]);
-                i = p + 1;
-                continue;
-            }
-
-            // Ищем начало тега <c ...> — ближайший '<' слева
-            let cpos = match memrchr(b'<', &src[..p]) {
-                Some(pos) if pos + 1 < src.len() && src[pos + 1] == b'c' => pos,
-                _ => {
-                    // На всякий случай: что-то странное → просто копируем и идём дальше
-                    dst.extend_from_slice(&src[i..=p]);
-                    i = p + 1;
-                    continue;
-                }
-            };
-
-            // Ищем конец тега <c ...>
-            let tag_end_rel = match memchr(b'>', &src[cpos..]) {
-                Some(x) => x,
-                None => {
-                    // Поломанный XML — копируем хвост и выходим
-                    dst.extend_from_slice(&src[i..]);
-                    self.sheet_xml = dst;
-                    return Ok(());
-                }
-            };
-            let tag_end = cpos + tag_end_rel;
-
-            // Ищем внутри тега атрибут s="..."
-            let s_finder = memmem::Finder::new(b" s=\"");
-            let sattr_opt = s_finder.find(&src[cpos..tag_end]).map(|rel| cpos + rel);
-
-            if let Some(sattr) = sattr_opt {
-                let val_start = sattr + 4; // после ` s="`
-                let val_end = find_bytes_from(&src, b"\"", val_start)
-                    .context("style attribute not closed")?;
-
-                if val_end > tag_end {
-                    // Кривая разметка — не трогаем тег
-                    dst.extend_from_slice(&src[i..=tag_end]);
-                    i = tag_end + 1;
-                    continue;
-                }
-
-                // Всё до атрибута s="..." копируем как есть
-                dst.extend_from_slice(&src[i..sattr]);
-                // Сам атрибут s="...": выкидываем, начиная с пробела и до закрывающей кавычки
-                // т.е. [sattr ..= val_end] пропускаем
-                i = val_end + 1;
-            } else {
-                // У клетки нет явного стиля — ничего не меняем
-                dst.extend_from_slice(&src[i..=tag_end]);
-                i = tag_end + 1;
-            }
-        }
-
-        // Хвост после последнего совпадения
-        dst.extend_from_slice(&src[i..]);
-
-        self.sheet_xml = dst;
-        Ok(())
+    fn remove_style_col(&mut self, col: u32) -> Result<()> {
+        self.edit_style_target(&Target::Col(col), None, None, false)
     }
-}
 
-impl XlsxEditor {
-    /// Apply column defaults and override existing cell number formats in one pass.
-    /// Unlike a rectangle style, this never materializes a million empty cells.
     pub fn force_column_formats(&mut self, formats: &[(usize, String)]) -> Result<()> {
+        if formats.is_empty() {
+            return Ok(());
+        }
         let mut patches = HashMap::new();
-        let mut defaults = Vec::with_capacity(formats.len());
+        let mut defaults = Vec::new();
         for (col, fmt) in formats {
             anyhow::ensure!(
                 *col < crate::data::MAX_COLUMNS,
@@ -2249,62 +1403,29 @@ impl XlsxEditor {
                 num_fmt_code: Some(fmt.clone()),
                 ..Default::default()
             };
-            let sid = self.ensure_style_from_parts(&patch)?;
-            defaults.push((*col as u32, sid));
-            patches.insert(*col, patch);
+            defaults.push((*col as u32, self.ensure_style_from_parts(&patch)?));
+            patches.insert(*col as u32, patch);
         }
         self.set_column_style_ids(&defaults)?;
-        let src = std::mem::take(&mut self.sheet_xml);
-        let result = (|| -> Result<Vec<u8>> {
-            let mut out = Vec::with_capacity(src.len());
-            let mut cursor = 0;
-            let mut search = 0;
-            let mut cache = HashMap::new();
-            while let Some(offset) = memmem::find(&src[search..], b"<c ") {
-                let begin = search + offset;
-                let end = find_bytes_from(&src, b">", begin).context("Malformed cell")?;
-                if let Some(col) = crate::extract_cell_col_idx(&src[begin..=end]) {
-                    if let Some(patch) = patches.get(&col) {
-                        let old_sid = crate::extract_style_id(&src[begin..=end]);
-                        let sid = if let Some(sid) = cache.get(&(col, old_sid)) {
-                            *sid
-                        } else {
-                            let old = self.read_style_parts(old_sid)?;
-                            let sid =
-                                self.ensure_style_from_parts(&merge_style_parts(old, patch))?;
-                            cache.insert((col, old_sid), sid);
-                            sid
-                        };
-                        out.extend_from_slice(&src[cursor..begin]);
-                        if let Some(offset) = memmem::find(&src[begin..end], b" s=\"") {
-                            let value_start = begin + offset + 4;
-                            let value_end = find_bytes_from(&src, b"\"", value_start)
-                                .context("Malformed style")?;
-                            out.extend_from_slice(&src[begin..value_start]);
-                            out.extend_from_slice(sid.to_string().as_bytes());
-                            out.extend_from_slice(&src[value_end..=end]);
-                        } else {
-                            out.extend_from_slice(&src[begin..begin + 2]);
-                            out.extend_from_slice(format!(" s=\"{sid}\"").as_bytes());
-                            out.extend_from_slice(&src[begin + 2..=end]);
-                        }
-                        cursor = end + 1;
-                    }
-                }
-                search = end + 1;
+        let mut cache = HashMap::new();
+        self.transform_cells(&Target::All, false, |editor, cell, col, _row| {
+            let Some(patch) = patches.get(&(col as u32)) else {
+                return Ok(None);
+            };
+            let old = cell.attr("s")?.map(|v| v.parse::<u32>()).transpose()?;
+            let sid = if let Some(sid) = cache.get(&(col, old)) {
+                *sid
+            } else {
+                let parts = editor.read_style_parts(old)?;
+                let sid = editor.ensure_style_from_parts(&merge_style_parts(parts, patch))?;
+                cache.insert((col, old), sid);
+                sid
+            };
+            if old == Some(sid) {
+                return Ok(None);
             }
-            out.extend_from_slice(&src[cursor..]);
-            Ok(out)
-        })();
-        match result {
-            Ok(out) => {
-                self.sheet_xml = out;
-                Ok(())
-            }
-            Err(error) => {
-                self.sheet_xml = src;
-                Err(error)
-            }
-        }
+            let tag = cell.set_attr("s", Some(&sid.to_string()))?;
+            Ok(Some(crate::xml::patch_opening(cell, &tag)))
+        })
     }
 }

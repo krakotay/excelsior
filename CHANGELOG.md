@@ -2,6 +2,19 @@
 
 ## 0.15.0
 
+- Share Editor XML, caches, and dimensions with Arc/copy-on-write; retain an open
+  original ZIP with independent cursors so branches survive atomic saves.
+- Add `WorkbookWriter` for bounded-memory creation using a typed disk spool,
+  direct ZIP output, iterator rollback, context management, and atomic save.
+- Replace byte-pattern XML editing with one namespace-aware span parser,
+  preserving unknown extensions and handling quote/prefix/CDATA variations.
+- Add `save(compression_level=3)` with levels 0..9 for all ZIP entries;
+  configure streaming compression at writer construction.
+- Cache parsed row spans for repeated scalar edits, invalidating offsets after
+  structural changes and keeping branch caches independent.
+- Cache generated sheet dimensions and assign initial column styles while
+  writing dataframe rows, avoiding subsequent whole-sheet format passes.
+
 - Allow `save()` to use the original create/open path; `save(other_path)` writes a
   copy without rebinding the editor. Remember absolute paths across cwd changes.
 

@@ -356,7 +356,10 @@ fn style_empty_inserted_sheet_before_cells_keeps_single_xml_root() -> Result<()>
     assert!(title.trim_start().starts_with("<?xml"));
     assert_eq!(title.matches("<worksheet").count(), 1);
     assert!(title.contains("<sheetData>"));
-    assert!(title.contains("<row r=\"4\">"));
+    assert_eq!(
+        XlsxEditor::open(&out, "Титульник")?.get_last_row_index("B")?,
+        12
+    );
     assert!(title.contains("РАБОЧИЕ ДОКУМЕНТЫ АУДИТОРА"));
     Ok(())
 }
@@ -423,7 +426,11 @@ fn column_text_format_then_title_styles_preserve_widths_and_styles() -> Result<(
     assert!(title.contains(r#"<col min="1" max="1" width="5" customWidth="1""#));
     assert!(title.contains(r#"<col min="3" max="3" width="40" customWidth="1""#));
     assert!(!title.contains(r#"width="0""#));
-    assert!(title.contains(r#"<c r="B4" s=""#));
+    assert!(
+        XlsxEditor::open(&out, "Титульник")?
+            .cell_style_id("B4")?
+            .is_some()
+    );
     Ok(())
 }
 
@@ -472,5 +479,35 @@ fn failed_sheet_selection_preserves_native_editor() -> Result<()> {
     editor.set_cell("B1", "alive")?;
     assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("original"));
     assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("alive"));
+    Ok(())
+}
+
+#[test]
+fn editor_snapshots_share_buffers_until_the_relevant_component_changes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("cow.xlsx");
+    let mut editor = XlsxEditor::create(&path, "Data")?;
+    editor.set_cell("A1", "original")?;
+    editor.set_font("A1", "Arial", 12.0, false, false)?;
+    let mut branch = editor.clone();
+    assert!(editor.sheet_xml.shares_with(&branch.sheet_xml));
+    assert!(editor.styles_xml.shares_with(&branch.styles_xml));
+    assert!(editor.workbook_xml.shares_with(&branch.workbook_xml));
+    assert!(editor.new_files.shares_with(&branch.new_files));
+    assert!(
+        editor
+            .styles_index
+            .as_ref()
+            .unwrap()
+            .shares_with(branch.styles_index.as_ref().unwrap())
+    );
+    branch.set_column_width("A", 20.0)?;
+    assert!(!editor.sheet_xml.shares_with(&branch.sheet_xml));
+    assert!(editor.styles_xml.shares_with(&branch.styles_xml));
+    assert!(editor.workbook_xml.shares_with(&branch.workbook_xml));
+    branch.set_fill("A1", "FF0000")?;
+    assert!(!editor.styles_xml.shares_with(&branch.styles_xml));
+    assert!(editor.workbook_xml.shares_with(&branch.workbook_xml));
+    assert!(String::from_utf8_lossy(&editor.sheet_xml).contains("original"));
     Ok(())
 }

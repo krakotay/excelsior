@@ -9,8 +9,9 @@ from .excelsior import (
     scan_excel,
 )
 from ._editor import Editor, Scanner
+from ._writer import WorkbookWriter
 
 __all__ = [
-    "Scanner", "Editor", "AlignSpec", "HorizAlignment", "VertAlignment",
+    "Scanner", "Editor", "WorkbookWriter", "AlignSpec", "HorizAlignment", "VertAlignment",
     "scan_excel", "create_excel", "__version__",
 ]

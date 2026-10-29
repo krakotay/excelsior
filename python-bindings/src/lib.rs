@@ -1,4 +1,4 @@
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
@@ -129,6 +129,51 @@ fn create_excel(path: PathBuf, sheet_name: &str) -> PyResult<()> {
     rust_core::create_excel(&path, sheet_name).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+fn ingest_rows<F>(rows: &Bound<'_, PyAny>, write: F) -> PyResult<()>
+where
+    F: FnOnce(
+        &mut dyn Iterator<Item = anyhow::Result<Vec<rust_core::data::CellValue>>>,
+    ) -> anyhow::Result<()>,
+{
+    use rust_core::data::CellValue;
+    let iterator = rows.try_iter()?;
+    let mut python_error = None;
+    let mut converted = iterator.map(|item| {
+        let values = item.and_then(|row| row.extract::<Vec<(u8, String)>>());
+        match values {
+            Ok(values) => values
+                .into_iter()
+                .map(|(kind, value)| {
+                    Ok(match kind {
+                        0 => CellValue::Blank,
+                        1 => CellValue::Text(value),
+                        2 => CellValue::Number(value),
+                        3 => CellValue::Boolean(value == "1"),
+                        _ => anyhow::bail!("Unknown cell type"),
+                    })
+                })
+                .collect(),
+            Err(error) => {
+                python_error = Some(error);
+                Err(anyhow::anyhow!("Data row conversion failed"))
+            }
+        }
+    });
+    let result = write(&mut converted);
+    if let Some(error) = python_error {
+        return Err(error);
+    }
+    result.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+fn compression_level(level: i32) -> PyResult<u8> {
+    if !(0..=9).contains(&level) {
+        return Err(PyValueError::new_err(
+            "compression_level must be between 0 and 9",
+        ));
+    }
+    Ok(level as u8)
+}
+
 #[pyclass(subclass)]
 struct Editor {
     editor: XlsxEditor,
@@ -162,6 +207,10 @@ impl Editor {
         }
     }
 
+    fn is_empty_sheet(&self) -> bool {
+        self.editor.is_empty_sheet()
+    }
+
     fn uses_1904_dates(&self) -> PyResult<bool> {
         self.editor
             .uses_1904_dates()
@@ -169,35 +218,7 @@ impl Editor {
     }
 
     fn write_typed_rows(&mut self, start: &str, rows: &Bound<'_, PyAny>) -> PyResult<()> {
-        use rust_core::data::CellValue;
-        let iterator = rows.try_iter()?;
-        let mut python_error = None;
-        let converted = iterator.map(|item| {
-            let values = item.and_then(|row| row.extract::<Vec<(u8, String)>>());
-            match values {
-                Ok(values) => values
-                    .into_iter()
-                    .map(|(kind, value)| {
-                        Ok(match kind {
-                            0 => CellValue::Blank,
-                            1 => CellValue::Text(value),
-                            2 => CellValue::Number(value),
-                            3 => CellValue::Boolean(value == "1"),
-                            _ => anyhow::bail!("Unknown cell type"),
-                        })
-                    })
-                    .collect(),
-                Err(error) => {
-                    python_error = Some(error);
-                    Err(anyhow::anyhow!("Data row conversion failed"))
-                }
-            }
-        });
-        let result = self.editor.write_typed_table_at(start, converted);
-        if let Some(error) = python_error {
-            return Err(error);
-        }
-        result.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        ingest_rows(rows, |rows| self.editor.write_typed_table_at(start, rows))
     }
 
     fn force_column_formats(&mut self, formats: Vec<(usize, String)>) -> PyResult<()> {
@@ -277,12 +298,23 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    #[pyo3(signature = (path = None))]
-    fn save(&mut self, path: Option<PathBuf>) -> PyResult<()> {
-        match path {
-            Some(path) => self.editor.save(path),
-            None => self.editor.save_in_place(),
+    #[pyo3(signature = (path = None, *, compression_level = 3))]
+    fn save(
+        &mut self,
+        py: Python<'_>,
+        path: Option<PathBuf>,
+        compression_level: i32,
+    ) -> PyResult<()> {
+        if !(0..=9).contains(&compression_level) {
+            return Err(PyValueError::new_err(
+                "compression_level must be between 0 and 9",
+            ));
         }
+        let destination = path.unwrap_or_else(|| self.editor.source_path().to_path_buf());
+        py.detach(|| {
+            self.editor
+                .save_with_compression(destination, compression_level as u8)
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -399,6 +431,71 @@ impl Editor {
 }
 
 #[pyclass]
+struct WorkbookWriter {
+    writer: rust_core::WorkbookWriter,
+}
+#[pymethods]
+impl WorkbookWriter {
+    #[new]
+    #[pyo3(signature=(path,sheet_name="Sheet1",*,compression_level=3))]
+    fn new(path: PathBuf, sheet_name: &str, compression_level: i32) -> PyResult<Self> {
+        Ok(Self {
+            writer: rust_core::WorkbookWriter::create(
+                path,
+                sheet_name,
+                crate::compression_level(compression_level)?,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+    fn next_row(&self) -> PyResult<u32> {
+        self.writer
+            .next_row()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn add_worksheet(&mut self, py: Python<'_>, sheet_name: &str) -> PyResult<()> {
+        py.detach(|| self.writer.add_worksheet(sheet_name))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn write_typed_rows(&mut self, start: &str, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+        ingest_rows(rows, |rows| self.writer.write_typed_rows(start, rows))
+    }
+    fn force_column_formats(&mut self, formats: Vec<(usize, String)>) -> PyResult<()> {
+        for (col, format) in formats {
+            self.writer
+                .set_column_format(col, &format)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+    fn set_number_format(&mut self, col_range: &str, fmt: &str) -> PyResult<()> {
+        for col in expand_column_selector(col_range.trim_end_matches(':'))? {
+            self.writer
+                .set_column_format(excel_col_to_index(&col)?, fmt)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+    fn set_column_width(&mut self, col_range: &str, width: f64) -> PyResult<()> {
+        let width = validate_width(width)?;
+        for col in expand_column_selector(col_range)? {
+            self.writer
+                .set_column_width(excel_col_to_index(&col)?, width)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+    #[pyo3(signature=(path=None))]
+    fn save(&mut self, py: Python<'_>, path: Option<PathBuf>) -> PyResult<()> {
+        py.detach(|| self.writer.save(path.as_deref()))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn abort(&mut self) {
+        self.writer.abort();
+    }
+}
+
+#[pyclass]
 struct Scanner {
     path: PathBuf,
 }
@@ -424,6 +521,7 @@ impl Scanner {
 fn excelsior(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Editor>()?;
+    m.add_class::<WorkbookWriter>()?;
     m.add_class::<Scanner>()?;
     m.add_function(wrap_pyfunction!(scan_excel, m)?)?;
     m.add_function(wrap_pyfunction!(create_excel, m)?)?;

@@ -1,7 +1,6 @@
 //! Explicit cell types and a one-pass table writer. No dataframe dependencies.
-use crate::{XlsxEditor, build_row_xml, parse_row_number, patch_row_xml};
+use crate::{XlsxEditor, build_row_xml, patch_row_xml, xml};
 use anyhow::{Context, Result, ensure};
-use memchr::memmem;
 use quick_xml::{Writer, events::BytesText};
 
 pub const MAX_ROWS: u32 = 1_048_576;
@@ -65,18 +64,7 @@ pub(crate) fn build_typed_cell_xml(
     value: &CellValue,
     sid: Option<u32>,
 ) -> Result<Vec<u8>> {
-    match value {
-        CellValue::Text(text) => ensure!(
-            text.chars().all(|c| matches!(c, '\t' | '\n' | '\r')
-                || (c >= '\u{20}' && c != '\u{fffe}' && c != '\u{ffff}')),
-            "Text contains an invalid XML character"
-        ),
-        CellValue::Number(number) => ensure!(
-            number.parse::<f64>().is_ok_and(f64::is_finite),
-            "Excel numbers must be finite"
-        ),
-        _ => {}
-    }
+    validate_cell(value)?;
     let mut writer = Writer::new(Vec::new());
     let mut cell = writer.create_element("c").with_attribute(("r", coord));
     if let Some(sid) = sid {
@@ -127,10 +115,23 @@ impl XlsxEditor {
         I: IntoIterator<Item = Result<Vec<CellValue>>>,
     {
         let (start_col, start_row) = parse_coord(start)?;
+        let mut dimensions = self.dimensions.get(&self.sheet_path).copied();
         // Appending must not scan or rebuild all previous rows on every call.
         if start_row > self.last_row {
-            let mut tail = Vec::new();
+            let empty_sheet = if self.last_row == 0 {
+                Some(xml::require(&self.sheet_xml, "sheetData")?)
+            } else {
+                None
+            };
+            let mut tail = if let Some(data) = &empty_sheet {
+                xml::begin_content(&self.sheet_xml, data)?
+            } else {
+                Vec::new()
+            };
             let mut last = self.last_row;
+            let mut wrote = false;
+            let column_styles = self.column_style_map()?;
+            let context = xml::root_context(&self.sheet_xml)?;
             for (offset, values) in rows.into_iter().enumerate() {
                 let values = values?;
                 let row_num = u32::try_from(offset)
@@ -145,35 +146,47 @@ impl XlsxEditor {
                     start_col + values.len() <= MAX_COLUMNS,
                     "XLSX column limit exceeded"
                 );
-                tail.extend_from_slice(&build_row_xml(row_num, start_col, &values)?);
+                let row_xml =
+                    crate::build_styled_row_xml(row_num, start_col, &values, &column_styles)?;
+                tail.extend_from_slice(&context.fragment(&row_xml)?);
+                if let Some((columns, rows)) = &mut dimensions
+                    && !values.is_empty()
+                {
+                    *columns = (*columns).max(start_col + values.len());
+                    *rows = (*rows).max(row_num);
+                }
                 last = row_num;
+                wrote = true;
             }
-            if !tail.is_empty() {
-                crate::ensure_sheetdata_open_close(&mut self.sheet_xml)?;
-                let insert = memmem::rfind(&self.sheet_xml, b"</sheetData>")
-                    .context("</sheetData> not found")?;
-                self.sheet_xml.splice(insert..insert, tail);
+            if wrote && let Some(data) = &empty_sheet {
+                xml::end_content(&self.sheet_xml, data, &mut tail)?;
+                self.sheet_xml = tail.into();
+                self.sheet_data_end = None;
+                self.row_index = None;
                 self.last_row = last;
+                if let Some(stats) = dimensions {
+                    self.dimensions.insert(self.sheet_path.clone(), stats);
+                }
+                return Ok(());
+            }
+            if wrote {
+                let insert = self.sheet_data_insertion()?;
+                let length = tail.len();
+                self.sheet_xml.splice(insert..insert, tail);
+                self.sheet_data_end = Some(insert + length);
+                self.row_index = None;
+                self.last_row = last;
+                if let Some(stats) = dimensions {
+                    self.dimensions.insert(self.sheet_path.clone(), stats);
+                }
             }
             return Ok(());
         }
-        // Work on a temporary result, leaving the original buffer intact on error.
-        let mut normalized = None;
-        if memmem::find(&self.sheet_xml, b"<sheetData/>").is_some() {
-            let mut xml = self.sheet_xml.clone();
-            crate::ensure_sheetdata_open_close(&mut xml)?;
-            normalized = Some(xml);
-        }
-        let src = normalized.as_deref().unwrap_or(&self.sheet_xml);
-        let sd = memmem::find(src, b"<sheetData").context("<sheetData> not found")?;
-        let content_start = memmem::find(&src[sd..], b">").context("Malformed sheetData")? + sd + 1;
-        let content_end = memmem::find(&src[content_start..], b"</sheetData>")
-            .context("</sheetData> not found")?
-            + content_start;
-        let mut out = Vec::with_capacity(src.len());
-        out.extend_from_slice(&src[..content_start]);
-        let mut cursor = content_start;
-        let mut pending = next_existing_row(src, cursor, content_end)?;
+        let data = xml::require(&self.sheet_xml, "sheetData")?;
+        let src = self.sheet_xml.as_slice();
+        let mut rows_in_sheet = data.children();
+        let mut pending = next_row(&mut rows_in_sheet)?;
+        let mut content = xml::begin_content(src, &data)?;
         let mut max_row = self.last_row;
         let mut wrote = false;
         for (offset, values) in rows.into_iter().enumerate() {
@@ -190,75 +203,105 @@ impl XlsxEditor {
                 start_col + values.len() <= MAX_COLUMNS,
                 "XLSX column limit exceeded"
             );
-            while let Some((number, _, end)) = pending {
-                if number >= row_num {
-                    break;
-                }
-                out.extend_from_slice(&src[cursor..end]);
-                cursor = end;
-                pending = next_existing_row(src, cursor, content_end)?;
+            while pending.as_ref().is_some_and(|(n, _)| *n < row_num) {
+                let (_, row) = pending.take().unwrap();
+                content.extend_from_slice(row.bytes());
+                pending = next_row(&mut rows_in_sheet)?;
             }
-            if let Some((number, begin, end)) = pending {
-                out.extend_from_slice(&src[cursor..begin]);
-                cursor = begin;
-                if number == row_num {
-                    out.extend_from_slice(&patch_row_xml(
-                        &src[begin..end],
-                        row_num,
-                        start_col,
-                        &values,
-                    )?);
-                    cursor = end;
-                    pending = next_existing_row(src, cursor, content_end)?;
-                } else {
-                    out.extend_from_slice(&build_row_xml(row_num, start_col, &values)?);
-                }
+            if pending.as_ref().is_some_and(|(n, _)| *n == row_num) {
+                let (_, row) = pending.take().unwrap();
+                content.extend_from_slice(&patch_row_xml(&row, row_num, start_col, &values)?);
+                pending = next_row(&mut rows_in_sheet)?;
             } else {
-                out.extend_from_slice(&build_row_xml(row_num, start_col, &values)?);
+                content.extend_from_slice(&xml::child_fragment(
+                    &data,
+                    &build_row_xml(row_num, start_col, &values)?,
+                )?);
+            }
+            if let Some((columns, rows)) = &mut dimensions
+                && !values.is_empty()
+            {
+                *columns = (*columns).max(start_col + values.len());
+                *rows = (*rows).max(row_num);
             }
             wrote = true;
             max_row = max_row.max(row_num);
         }
         if wrote {
-            out.extend_from_slice(&src[cursor..]);
-            self.sheet_xml = out;
+            if let Some((_, row)) = pending {
+                content.extend_from_slice(row.bytes());
+            }
+            for row in rows_in_sheet {
+                content.extend_from_slice(row?.bytes());
+            }
+            xml::end_content(src, &data, &mut content)?;
+            self.sheet_xml = content.into();
+            self.sheet_data_end = None;
+            self.row_index = None;
             self.last_row = max_row;
+            if let Some(stats) = dimensions {
+                self.dimensions.insert(self.sheet_path.clone(), stats);
+            }
         }
         Ok(())
     }
 
     pub fn uses_1904_dates(&self) -> Result<bool> {
-        let mut reader = quick_xml::Reader::from_reader(self.workbook_xml.as_slice());
-        loop {
-            match reader.read_event()? {
-                quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e)
-                    if e.name().as_ref().as_bytes() == b"workbookPr" =>
-                {
-                    for a in e.attributes() {
-                        let a = a?;
-                        if a.key.as_ref().as_bytes() == b"date1904" {
-                            return Ok(matches!(a.value.as_ref(), "1" | "true"));
-                        }
-                    }
-                }
-                quick_xml::events::Event::Eof => return Ok(false),
-                _ => {}
-            }
-        }
+        let root = xml::root(&self.workbook_xml)?;
+        let Some(properties) = root.child("workbookPr")? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            properties.attr("date1904")?.as_deref(),
+            Some("1" | "true")
+        ))
     }
 }
 
-fn next_existing_row(src: &[u8], from: usize, end: usize) -> Result<Option<(u32, usize, usize)>> {
-    let Some(offset) = memmem::find(&src[from..end], b"<row ") else {
-        return Ok(None);
-    };
-    let begin = from + offset;
-    let tag_end = memmem::find(&src[begin..end], b">").context("Malformed row")? + begin;
-    let number = parse_row_number(src, begin, tag_end).context("Missing/invalid row number")?;
-    let finish = if src[tag_end - 1] == b'/' {
-        tag_end + 1
-    } else {
-        memmem::find(&src[tag_end..end], b"</row>").context("</row> not found")? + tag_end + 6
-    };
-    Ok(Some((number, begin, finish)))
+fn next_row<'a>(elements: &mut xml::Elements<'a>) -> Result<Option<(u32, xml::Element<'a>)>> {
+    if let Some(element) = elements.next() {
+        let element = element?;
+        anyhow::ensure!(
+            element.is("row", xml::SHEET_NS),
+            "Unexpected element in sheetData"
+        );
+        let number = element.attr("r")?.context("Row number missing")?.parse()?;
+        return Ok(Some((number, element)));
+    }
+    Ok(None)
+}
+
+impl XlsxEditor {
+    pub(crate) fn sheet_data_insertion(&mut self) -> Result<usize> {
+        if let Some(end) = self.sheet_data_end {
+            return Ok(end);
+        }
+        let data = xml::require(&self.sheet_xml, "sheetData")?;
+        let end = if data.empty {
+            let replacement = data.with_content(&[])?;
+            let position = data.full.start + xml::root(&replacement)?.content.end;
+            self.sheet_xml = xml::replace_element(&self.sheet_xml, &data, &replacement).into();
+            position
+        } else {
+            data.content.end
+        };
+        self.sheet_data_end = Some(end);
+        Ok(end)
+    }
+}
+
+pub(crate) fn validate_cell(value: &CellValue) -> Result<()> {
+    match value {
+        CellValue::Text(text) => ensure!(
+            text.chars().all(|c| matches!(c, '\t' | '\n' | '\r')
+                || (c >= '\u{20}' && c != '\u{fffe}' && c != '\u{ffff}')),
+            "Text contains an invalid XML character"
+        ),
+        CellValue::Number(number) => ensure!(
+            number.parse::<f64>().is_ok_and(f64::is_finite),
+            "Excel numbers must be finite"
+        ),
+        _ => {}
+    }
+    Ok(())
 }

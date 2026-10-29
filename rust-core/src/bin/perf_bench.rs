@@ -463,8 +463,8 @@ fn bench_style_precision(
     let details = Rc::new(RefCell::new(Vec::new()));
     let details_for_run = Rc::clone(&details);
     let result = run_bench("style_precision", &src, &dst, move |editor| {
-        let rows = cfg.style_seed_rows.min(8_000).max(256) as u32;
-        let cols = cfg.style_cols.min(20).max(8) as u32;
+        let rows = cfg.style_seed_rows.clamp(256, 8_000) as u32;
+        let cols = cfg.style_cols.clamp(8, 20) as u32;
         let right = excel_col_name(cols - 1);
         let mid = excel_col_name((cols / 2).max(1) - 1);
         let bottom = rows;
@@ -492,7 +492,7 @@ fn bench_style_precision(
         for layer in 0..12u32 {
             let row_start = 1 + layer * (rows / 12).max(1);
             let row_end = (row_start + (rows / 3)).min(bottom);
-            let left = excel_col_name((layer % (cols / 2).max(1)) as u32);
+            let left = excel_col_name(layer % (cols / 2).max(1));
             let range = format!("{left}{row_start}:{right}{row_end}");
             let focused = format!("{mid}{row_start}:{right}{row_end}");
             let fmt = match layer % 4 {
