@@ -17,16 +17,26 @@ def xml_parts(path):
         return {name: archive.read(name) for name in archive.namelist()}
 
 
-@pytest.mark.parametrize("method,args", [
-    ("add_worksheet", ("New",)), ("add_worksheet_at", ("New", 0)),
-    ("with_worksheet", ("Other",)), ("rename_worksheet", ("Other", "Renamed")),
-    ("delete_worksheet", ("Other",)), ("set_number_format", ("A1", "0.00")),
-    ("set_fill", ("A1", "FFFF00")), ("merge_cells", ("B1:C1",)),
-    ("set_border", ("A1", "thin")), ("set_font", ("A1", "Arial", 14.0)),
-    ("set_column_width", ("A", 22.0)), ("set_column_width_range", ("A:C", 22.0)),
-    ("set_columns_width", (["A", "C:D"], 22.0)), ("set_column_widths", ({"A": 22.0},)),
-    ("remove_style", ("A1",)),
-])
+@pytest.mark.parametrize(
+    "method,args",
+    [
+        ("add_worksheet", ("New",)),
+        ("add_worksheet_at", ("New", 0)),
+        ("with_worksheet", ("Other",)),
+        ("rename_worksheet", ("Other", "Renamed")),
+        ("delete_worksheet", ("Other",)),
+        ("set_number_format", ("A1", "0.00")),
+        ("set_fill", ("A1", "FFFF00")),
+        ("merge_cells", ("B1:C1",)),
+        ("set_border", ("A1", "thin")),
+        ("set_font", ("A1", "Arial", 14.0)),
+        ("set_column_width", ("A", 22.0)),
+        ("set_column_width_range", ("A:C", 22.0)),
+        ("set_columns_width", (["A", "C:D"], 22.0)),
+        ("set_column_widths", ({"A": 22.0},)),
+        ("remove_style", ("A1",)),
+    ],
+)
 def test_editor_returning_methods_do_not_mutate_input(tmp_path, method, args):
     path = tmp_path / "source.xlsx"
     editor = Editor.create(path).add_worksheet("Other").with_worksheet("Sheet1")
@@ -44,8 +54,10 @@ def test_editor_returning_methods_do_not_mutate_input(tmp_path, method, args):
 
 def test_alignment_copy_and_subclass_survive_factories(tmp_path):
     from excelsior import AlignSpec, HorizAlignment
+
     class CustomEditor(Editor):
         pass
+
     editor = CustomEditor.create(tmp_path / "source.xlsx")
     editor.set_cell("A1", "original")
     editor.extra = [1]
@@ -69,11 +81,26 @@ def test_none_returning_operations_mutate(tmp_path):
     assert editor.with_polars(pl.DataFrame({"fourth": [4]}), "C1") is None
     assert editor.save(path) is None
     ws = get_sheet(path, "Sheet1")
-    assert [ws[c].value for c in ["A1", "A2", "B1", "C1", "C2"]] == ["first", "second", "third", "fourth", 4]
+    assert [ws[c].value for c in ["A1", "A2", "B1", "C1", "C2"]] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+        4,
+    ]
 
 
 def test_polars_strings_keep_exact_values_and_never_become_formulas(tmp_path):
-    values = ["111111119999999", "00123", "12345678901234567890", "=1+1", "1e50", " 01 ", "< & >", ""]
+    values = [
+        "111111119999999",
+        "00123",
+        "12345678901234567890",
+        "=1+1",
+        "1e50",
+        " 01 ",
+        "< & >",
+        "",
+    ]
     path = tmp_path / "strings.xlsx"
     editor = Editor.create(path)
     editor.with_polars(pl.DataFrame({"00123": values}, schema={"00123": pl.String}))
@@ -87,8 +114,24 @@ def test_polars_strings_keep_exact_values_and_never_become_formulas(tmp_path):
     assert ws.column_dimensions["A"].number_format == "@"
 
 
-@pytest.mark.parametrize("dtype", [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, pl.Float32, pl.Float64])
-def test_numeric_dtype_forces_entire_column_including_outside_written_area(tmp_path, dtype):
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+        pl.Float32,
+        pl.Float64,
+    ],
+)
+def test_numeric_dtype_forces_entire_column_including_outside_written_area(
+    tmp_path, dtype
+):
     path = tmp_path / "numbers.xlsx"
     book = openpyxl.Workbook()
     ws = book.active
@@ -107,7 +150,9 @@ def test_numeric_dtype_forces_entire_column_including_outside_written_area(tmp_p
     assert ws.column_dimensions["B"].number_format == expected
     assert ws["C20"].number_format == "0.00000"
     with ZipFile(path) as archive:
-        assert archive.read("xl/worksheets/sheet1.xml").count(b"<row ") == 5  # no million-row expansion
+        assert (
+            archive.read("xl/worksheets/sheet1.xml").count(b"<row ") == 5
+        )  # no million-row expansion
 
 
 def test_disabling_column_formats_preserves_template_but_not_type_inference(tmp_path):
@@ -115,7 +160,9 @@ def test_disabling_column_formats_preserves_template_but_not_type_inference(tmp_
     editor = Editor.create(path)
     editor.append_table_at([["old", "old"], ["123", "1"]], "A1")
     editor = editor.set_number_format("A2:B2", "0.00000")
-    editor.with_polars(pl.DataFrame({"id": ["00123"], "n": [12]}), force_column_formats=False)
+    editor.with_polars(
+        pl.DataFrame({"id": ["00123"], "n": [12]}), force_column_formats=False
+    )
     editor.save(path)
     ws = get_sheet(path, "Sheet1")
     assert ws["A2"].value == "00123" and ws["A2"].data_type == "s"
@@ -124,7 +171,9 @@ def test_disabling_column_formats_preserves_template_but_not_type_inference(tmp_
     assert ws.column_dimensions["A"].number_format == "General"
 
 
-@pytest.mark.parametrize("dtype,fmt", [(pl.String, "@"), (pl.Int64, "0"), (pl.Float64, "0.###############")])
+@pytest.mark.parametrize(
+    "dtype,fmt", [(pl.String, "@"), (pl.Int64, "0"), (pl.Float64, "0.###############")]
+)
 def test_empty_typed_columns_still_have_a_column_format(tmp_path, dtype, fmt):
     path = tmp_path / "empty.xlsx"
     editor = Editor.create(path)
@@ -136,7 +185,9 @@ def test_empty_typed_columns_still_have_a_column_format(tmp_path, dtype, fmt):
 def test_nonfinite_numbers_are_valid_text_cells(tmp_path):
     path = tmp_path / "finite.xlsx"
     editor = Editor.create(path)
-    editor.with_polars(pl.DataFrame({"n": [float("nan"), float("inf"), -float("inf"), 1.25]}))
+    editor.with_polars(
+        pl.DataFrame({"n": [float("nan"), float("inf"), -float("inf"), 1.25]})
+    )
     editor.append_row(["nan", "inf", "-inf"])
     editor.save(path)
     ws = get_sheet(path, "Sheet1")
@@ -150,11 +201,17 @@ def test_decimal_temporal_and_1904_epoch(tmp_path):
     book.epoch = CALENDAR_MAC_1904
     book.save(path)
     editor = Editor.open(path)
-    editor.with_polars(pl.DataFrame({
-        "decimal": pl.Series([Decimal("123.450")], dtype=pl.Decimal(12, 3)),
-        "date": [date(2025, 1, 2)], "dt": [datetime(2025, 1, 2, 3, 4, 5)],
-        "time": [time(12, 30)], "duration": [timedelta(hours=30)],
-    }))
+    editor.with_polars(
+        pl.DataFrame(
+            {
+                "decimal": pl.Series([Decimal("123.450")], dtype=pl.Decimal(12, 3)),
+                "date": [date(2025, 1, 2)],
+                "dt": [datetime(2025, 1, 2, 3, 4, 5)],
+                "time": [time(12, 30)],
+                "duration": [timedelta(hours=30)],
+            }
+        )
+    )
     editor.save(path)
     ws = get_sheet(path, "Sheet")
     assert ws["A2"].value == 123.45 and ws["A2"].number_format == "0.000"
@@ -178,12 +235,18 @@ def test_append_beyond_z_and_ordered_cell_insertion(tmp_path):
     assert [ws.cell(2, c).value for c in range(1, 5)] == [1, 20, 30, 4]
 
 
-@pytest.mark.parametrize("coord", ["A0", "XFE1", "A1048577", "1", "A-1", "A1x", "A18446744073709551616"])
+@pytest.mark.parametrize(
+    "coord", ["A0", "XFE1", "A1048577", "1", "A-1", "A1x", "A18446744073709551616"]
+)
 def test_invalid_coordinates_fail_without_damaging_state(tmp_path, coord):
     path = tmp_path / "invalid.xlsx"
     editor = Editor.create(path)
     editor.set_cell("A1", "original")
-    for operation in [lambda: editor.set_cell(coord, "bad"), lambda: editor.append_table_at([["bad"]], coord), lambda: editor.set_fill(coord, "FF0000")]:
+    for operation in [
+        lambda: editor.set_cell(coord, "bad"),
+        lambda: editor.append_table_at([["bad"]], coord),
+        lambda: editor.set_fill(coord, "FF0000"),
+    ]:
         with pytest.raises(RuntimeError):
             operation()
     editor.set_cell("B1", "alive")
@@ -197,11 +260,14 @@ def test_failed_sheet_selection_and_iterator_leave_editor_usable(tmp_path):
     editor.set_cell("A1", "original")
     with pytest.raises(RuntimeError):
         editor.with_worksheet("Missing")
+
     class BrokenFrame:
         columns = ["a"]
+
         def iter_rows(self):
             yield (1,)
             raise ValueError("broken row source")
+
     with pytest.raises(ValueError, match="broken row source"):
         editor.with_polars(BrokenFrame())
     editor.set_cell("B1", "alive")
@@ -214,7 +280,9 @@ def test_write_into_self_closing_styled_row(tmp_path):
     editor = Editor.create(path)
     with ZipFile(path) as archive:
         parts = {n: archive.read(n) for n in archive.namelist()}
-    parts["xl/worksheets/sheet1.xml"] = parts["xl/worksheets/sheet1.xml"].replace(b"<sheetData/>", b'<sheetData><row r="2"/></sheetData>')
+    parts["xl/worksheets/sheet1.xml"] = parts["xl/worksheets/sheet1.xml"].replace(
+        b"<sheetData/>", b'<sheetData><row r="2"/></sheetData>'
+    )
     with ZipFile(path, "w") as archive:
         for name, data in parts.items():
             archive.writestr(name, data)
@@ -282,9 +350,12 @@ def test_invalid_style_ids_report_normal_errors_and_preserve_input(tmp_path):
     editor.save(path)
     with ZipFile(path) as archive:
         parts = {n: archive.read(n) for n in archive.namelist()}
-    parts["xl/worksheets/sheet1.xml"] = parts["xl/worksheets/sheet1.xml"].replace(b'<c r="A1"', b'<c r="A1" s="999999"')
+    parts["xl/worksheets/sheet1.xml"] = parts["xl/worksheets/sheet1.xml"].replace(
+        b'<c r="A1"', b'<c r="A1" s="999999"'
+    )
     with ZipFile(path, "w") as archive:
-        for name, data in parts.items(): archive.writestr(name, data)
+        for name, data in parts.items():
+            archive.writestr(name, data)
     editor = Editor.open(path)
     with pytest.raises(RuntimeError, match="style id"):
         editor.set_fill("A1", "FF0000")
@@ -321,8 +392,12 @@ def test_save_without_path_and_save_as_do_not_rebind_editor(tmp_path):
     assert get_sheet(copied, "Sheet1")["B1"].value is None
 
 
-@pytest.mark.parametrize("factory", [Editor.open, lambda path: Scanner(path).open_editor()])
-def test_save_default_path_is_retained_by_factories_and_functional_copies(tmp_path, factory):
+@pytest.mark.parametrize(
+    "factory", [Editor.open, lambda path: Scanner(path).open_editor()]
+)
+def test_save_default_path_is_retained_by_factories_and_functional_copies(
+    tmp_path, factory
+):
     path = tmp_path / "opened.xlsx"
     Editor.create(path)
     editor = factory(path).add_worksheet("New").set_column_width("A", 20)

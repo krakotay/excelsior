@@ -19,7 +19,10 @@ def test_with_polars_formats_bool_and_datetime_columns(tmp_path: Path) -> None:
         {
             "name": ["alpha", "beta"],
             "flag": [True, False],
-            "created_at": [datetime(2025, 1, 2, 3, 4, 5), datetime(2025, 1, 3, 6, 7, 8)],
+            "created_at": [
+                datetime(2025, 1, 2, 3, 4, 5),
+                datetime(2025, 1, 3, 6, 7, 8),
+            ],
             "birthday": [date(2025, 1, 2), date(2025, 1, 3)],
         }
     )
@@ -60,7 +63,9 @@ def test_sliced_frame_and_chained_editor_do_not_use_arrow(tmp_path, monkeypatch)
     assert ws["C5"].value == 2
 
 
-@pytest.mark.parametrize("factory", [Editor, Editor.open, lambda path: Scanner(path).open_editor()])
+@pytest.mark.parametrize(
+    "factory", [Editor, Editor.open, lambda path: Scanner(path).open_editor()]
+)
 def test_open_factories_return_python_adapter(tmp_path, factory):
     path = tmp_path / "factory.xlsx"
     Editor.create(path)
@@ -71,11 +76,14 @@ def test_open_factories_return_python_adapter(tmp_path, factory):
     assert get_sheet(path, "Sheet1")["A2"].value == 7
 
 
-@pytest.mark.parametrize("frame, expected", [
-    (pl.DataFrame(), None),
-    (pl.DataFrame(schema={"name": pl.String}), "name"),
-    (pl.DataFrame({"name": [None]}, schema={"name": pl.String}), "name"),
-])
+@pytest.mark.parametrize(
+    "frame, expected",
+    [
+        (pl.DataFrame(), None),
+        (pl.DataFrame(schema={"name": pl.String}), "name"),
+        (pl.DataFrame({"name": [None]}, schema={"name": pl.String}), "name"),
+    ],
+)
 def test_empty_frames_and_nulls(tmp_path, frame, expected):
     path = tmp_path / "empty.xlsx"
     editor = Editor.create(path)

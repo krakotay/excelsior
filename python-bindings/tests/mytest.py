@@ -11,12 +11,14 @@ scanner = Scanner(file_path)
 editor = scanner.open_editor(scanner.get_sheets()[0])
 
 
-editor.append_table_at([[str(k) for k in list(range(50))] for _k in list(range(5))], "B4")
+editor.append_table_at(
+    [[str(k) for k in list(range(50))] for _k in list(range(5))], "B4"
+)
 h = 3000
 w = 3
 editor = editor.with_worksheet(scanner.get_sheets()[1])
 editor.with_polars(pl.DataFrame({str(i + 1): list(range(h)) for i in range(w)}), "C9")
-# editor = 
+# editor =
 editor.save(out_path)
 
 print("done")

@@ -22,12 +22,22 @@ def assert_with_libreoffice(path: Path) -> None:
         proc = subprocess.run(
             [
                 executable,
-                "--headless", "--nologo", "--nodefault", "--nolockcheck",
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
                 "--nofirststartwizard",
                 f"-env:UserInstallation={(root / 'profile').as_uri()}",
-                "--convert-to", "csv", "--outdir", str(root), str(path),
+                "--convert-to",
+                "csv",
+                "--outdir",
+                str(root),
+                str(path),
             ],
-            check=False, capture_output=True, text=True, timeout=30,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         assert (root / path.with_suffix(".csv").name).exists(), (
             f"LibreOffice produced no CSV (exit {proc.returncode})\n"

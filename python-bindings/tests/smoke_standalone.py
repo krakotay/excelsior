@@ -1,4 +1,5 @@
 """Run directly in a clean environment, before installing test dependencies."""
+
 import importlib.abc
 from pathlib import Path
 import sys
@@ -8,7 +9,13 @@ import zipfile
 
 class BlockOptionalDependencies(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in {"polars", "pyarrow", "numpy", "openpyxl", "pytest"}:
+        if fullname.split(".")[0] in {
+            "polars",
+            "pyarrow",
+            "numpy",
+            "openpyxl",
+            "pytest",
+        }:
             raise ImportError(f"Optional dependency must not be imported: {fullname}")
 
 

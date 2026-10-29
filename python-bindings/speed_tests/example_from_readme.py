@@ -16,9 +16,9 @@ df = pl.DataFrame(
         "string3": ["a" * 100, "b" * 100, "c" * 100] * 1000,
         "string4": ["a" * 100, "b" * 100, "c" * 100] * 1000,
         "string5": ["a" * 100, "b" * 100, "c" * 100] * 1000,
-        "string6" : ["a" * 100, "b" * 100, "c" * 100] * 1000,
-        "string7" : ["a" * 100, "b" * 100, "c" * 100] * 1000,
+        "string6": ["a" * 100, "b" * 100, "c" * 100] * 1000,
+        "string7": ["a" * 100, "b" * 100, "c" * 100] * 1000,
     }
 )
-editor.with_polars(df, "D10") # THIS WILL NOT CHANGE FORMATTING OF EXISTING CELLS!
+editor.with_polars(df, "D10")  # THIS WILL NOT CHANGE FORMATTING OF EXISTING CELLS!
 editor.save(os.path.join(base_dir, "100mb_excelsior_polars_1.xlsx"))

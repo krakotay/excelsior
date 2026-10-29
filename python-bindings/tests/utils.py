@@ -1,6 +1,7 @@
 import time
 from contextlib import contextmanager
 
+
 @contextmanager
 def measure(label: str = ""):
     start = time.perf_counter()

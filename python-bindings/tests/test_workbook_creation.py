@@ -60,7 +60,7 @@ def test_create_relative_filename_in_working_directory(tmp_path, monkeypatch):
     assert ws["B1"].value == 42
 
 
-@pytest.mark.parametrize("name", ["Я" * 31, "Data & <values> \"2026\""])
+@pytest.mark.parametrize("name", ["Я" * 31, 'Data & <values> "2026"'])
 def test_create_nested_path_with_unicode_and_escaped_sheet_names(tmp_path, name):
     path = tmp_path / "nested" / "new.xlsx"
     create_excel(path, name)
@@ -68,7 +68,9 @@ def test_create_nested_path_with_unicode_and_escaped_sheet_names(tmp_path, name)
     assert get_sheet(path, name)["A1"].value is None
 
 
-@pytest.mark.parametrize("name", ["", "x" * 32, "bad/name", "'quoted", "quoted'", "bad\x00name"])
+@pytest.mark.parametrize(
+    "name", ["", "x" * 32, "bad/name", "'quoted", "quoted'", "bad\x00name"]
+)
 def test_invalid_sheet_name_preserves_existing_file(tmp_path, name):
     path = tmp_path / "existing.xlsx"
     path.write_bytes(b"keep")

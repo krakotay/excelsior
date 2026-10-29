@@ -13,5 +13,5 @@ df = pl.DataFrame(
         "string": ["a" * 100, "b" * 100, "c" * 100] * 1000,
     }
 )
-editor.add_worksheet('polars_df').with_polars(df)
+editor.add_worksheet("polars_df").with_polars(df)
 editor.save(os.path.join(base_dir, "100mb_excelsior_polars.xlsx"))

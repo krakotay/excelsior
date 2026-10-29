@@ -12,10 +12,13 @@ alignment = Alignment(horizontal="center", vertical="center")
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
 wb = openpyxl.open(os.path.join(base_dir, "../../test/100mb.xlsx"))
-ws = wb['Tablo3']
+ws = wb["Tablo3"]
+
+
 def generate_table(width: int, height: int):
-    table = [['a' + str(i + j) * 10 for i in range(width)] for j in range(height)]
+    table = [["a" + str(i + j) * 10 for i in range(width)] for j in range(height)]
     return table
+
 
 data = generate_table(5, 200)
 for row in data:
@@ -24,10 +27,12 @@ for row in data:
 start_row = 99930
 end_row = start_row + len(data) - 1
 start_col = 1  # A
-end_col = 5    # E
+end_col = 5  # E
 
 # Применение стилей ко всем ячейкам в диапазоне
-for row in ws.iter_rows(min_row=start_row, max_row=end_row, min_col=start_col, max_col=end_col):
+for row in ws.iter_rows(
+    min_row=start_row, max_row=end_row, min_col=start_col, max_col=end_col
+):
     for cell in row:
         cell.border = border
         cell.alignment = alignment

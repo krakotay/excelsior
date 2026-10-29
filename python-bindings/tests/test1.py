@@ -1,5 +1,6 @@
 from excelsior import scan_excel, Editor
 import os
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 assert scan_excel(os.path.join(base_dir, "../../test/test_sum.xlsx")) == ["Sheet1"]
 editor = Editor(os.path.join(base_dir, "../../test/test_last_row_index.xlsx"), "Sheet1")

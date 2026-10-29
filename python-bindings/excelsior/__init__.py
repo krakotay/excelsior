@@ -12,6 +12,13 @@ from ._editor import Editor, Scanner
 from ._writer import WorkbookWriter
 
 __all__ = [
-    "Scanner", "Editor", "WorkbookWriter", "AlignSpec", "HorizAlignment", "VertAlignment",
-    "scan_excel", "create_excel", "__version__",
+    "Scanner",
+    "Editor",
+    "WorkbookWriter",
+    "AlignSpec",
+    "HorizAlignment",
+    "VertAlignment",
+    "scan_excel",
+    "create_excel",
+    "__version__",
 ]
