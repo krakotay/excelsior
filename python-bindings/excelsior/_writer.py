@@ -12,13 +12,14 @@ class WorkbookWriter:
     Rows use a temporary disk spool; completed sheets are immediately written to
     ZIP. save/close finalizes the writer. The existing destination is preserved
     until save succeeds. Set compression at construction, before closing sheets.
+    compression_threads closes independent sheets in parallel using disk files.
     """
-    def __init__(self, path: str | PathLike[str], sheet_name: str = "Sheet1", *, compression_level: int = 3) -> None:
-        self._native = _Writer(path, sheet_name, compression_level=compression_level)
+    def __init__(self, path: str | PathLike[str], sheet_name: str = "Sheet1", *, compression_level: int = 3, compression_threads: int = 1) -> None:
+        self._native = _Writer(path, sheet_name, compression_level=compression_level, compression_threads=compression_threads)
 
     @classmethod
-    def create(cls: type[_WriterT], path: str | PathLike[str], sheet_name: str = "Sheet1", *, compression_level: int = 3) -> _WriterT:
-        return cls(path, sheet_name, compression_level=compression_level)
+    def create(cls: type[_WriterT], path: str | PathLike[str], sheet_name: str = "Sheet1", *, compression_level: int = 3, compression_threads: int = 1) -> _WriterT:
+        return cls(path, sheet_name, compression_level=compression_level, compression_threads=compression_threads)
 
     def add_worksheet(self, sheet_name: str) -> None:
         """Close the current sheet and select a new one; do not assign the result."""

@@ -352,6 +352,18 @@ impl XlsxEditor {
         destination: P,
         compression_level: u8,
     ) -> Result<()> {
+        self.save_with_options(destination, compression_level, 1)
+    }
+    pub fn save_with_options<P: AsRef<Path>>(
+        &mut self,
+        destination: P,
+        compression_level: u8,
+        compression_threads: usize,
+    ) -> Result<()> {
+        ensure!(
+            compression_threads > 0,
+            "compression_threads must be positive"
+        );
         ensure!(
             compression_level <= 9,
             "compression_level must be between 0 and 9"
@@ -365,12 +377,85 @@ impl XlsxEditor {
             .prefix(".excelsior-save-")
             .suffix(".xlsx")
             .tempfile_in(parent)?;
-        self.write_archive(temp.path(), compression_level)?;
+        if compression_threads == 1 {
+            self.write_archive(temp.path(), compression_level)?;
+        } else {
+            self.write_archive_parallel(temp.path(), compression_level, compression_threads)?;
+        }
         if let Ok(metadata) = std::fs::metadata(path) {
             temp.as_file().set_permissions(metadata.permissions())?;
         }
         temp.as_file().sync_all()?;
         temp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+    fn write_archive_parallel(&mut self, path: &Path, level: u8, threads: usize) -> Result<()> {
+        let mut input = ZipArchive::new(self.source.reader())?;
+        let ct: Bytes = content_types(&read_part(&mut input, "[Content_Types].xml")?, self)?.into();
+        let mut names = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..input.len() {
+            let name = input.by_index_raw(i)?.name()?.into_owned();
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+        for name in self
+            .new_files
+            .keys()
+            .chain(std::iter::once(&self.sheet_path))
+        {
+            if seen.insert(name.clone()) {
+                names.push(name.clone());
+            }
+        }
+        drop(input);
+        let mut output = ZipWriter::new(File::create(path)?);
+        let mut compressor = crate::parallel::Compressor::new(
+            path.parent().context("ZIP parent missing")?,
+            threads,
+        )?;
+        for name in names {
+            if self.removed_files.contains(&name) {
+                continue;
+            }
+            let (bytes, sheet) = if name == self.sheet_path {
+                (Some(self.sheet_xml.clone()), true)
+            } else {
+                match name.as_str() {
+                    "xl/workbook.xml" => (Some(self.workbook_xml.clone()), false),
+                    "xl/_rels/workbook.xml.rels" => (Some(self.rels_xml.clone()), false),
+                    "xl/styles.xml" => (Some(self.styles_xml.clone()), false),
+                    "[Content_Types].xml" => (Some(ct.clone()), false),
+                    _ => (
+                        self.new_files.get(&name).cloned(),
+                        self.new_files.contains_key(&name),
+                    ),
+                }
+            };
+            let source = self.source.clone();
+            let known = self.dimensions.get(&name).copied();
+            compressor.submit(&mut output, move |part| {
+                if let Some(bytes) = bytes {
+                    if sheet {
+                        let stats = write_sheet(part, &name, &bytes, level, known)?;
+                        return Ok(Some((name, stats)));
+                    }
+                    write_part(part, &name, &bytes, level)?;
+                } else {
+                    let mut archive = ZipArchive::new(source.reader())?;
+                    let mut original = archive.by_name(&name)?;
+                    part.start_file(&name, compression_options(level))?;
+                    std::io::copy(&mut original, part)?;
+                }
+                Ok(None)
+            })?;
+        }
+        let dimensions = compressor.finish(&mut output)?;
+        output.finish()?;
+        for (name, stats) in dimensions {
+            self.dimensions.insert(name, stats);
+        }
         Ok(())
     }
     fn write_archive(&mut self, path: &Path, compression_level: u8) -> Result<()> {

@@ -104,6 +104,7 @@ impl Styles {
 pub struct WorkbookWriter {
     destination: PathBuf,
     compression: u8,
+    compressor: Option<crate::parallel::Compressor>,
     zip: Option<ZipWriter<NamedTempFile>>,
     completed: Option<NamedTempFile>,
     published: Option<crate::archive::Source>,
@@ -119,6 +120,18 @@ impl WorkbookWriter {
         sheet_name: &str,
         compression_level: u8,
     ) -> Result<Self> {
+        Self::create_with_options(path, sheet_name, compression_level, 1)
+    }
+    pub fn create_with_options<P: AsRef<Path>>(
+        path: P,
+        sheet_name: &str,
+        compression_level: u8,
+        compression_threads: usize,
+    ) -> Result<Self> {
+        ensure!(
+            compression_threads > 0,
+            "compression_threads must be positive"
+        );
         ensure!(
             compression_level <= 9,
             "compression_level must be between 0 and 9"
@@ -132,9 +145,18 @@ impl WorkbookWriter {
             .suffix(".xlsx")
             .tempfile_in(parent)?;
         let active = Sheet::new(name, parent)?;
+        let compressor = if compression_threads > 1 {
+            Some(crate::parallel::Compressor::new(
+                parent,
+                compression_threads,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             destination,
             compression: compression_level,
+            compressor,
             zip: Some(ZipWriter::new(archive)),
             completed: None,
             published: None,
@@ -284,82 +306,24 @@ impl WorkbookWriter {
         }
         result
     }
-    fn encode_sheet(&mut self, mut sheet: Sheet) -> Result<()> {
+    fn encode_sheet(&mut self, sheet: Sheet) -> Result<()> {
         let mut ids = BTreeMap::new();
         for (&col, fmt) in &sheet.formats {
             ids.insert(col, self.styles.id(fmt)?);
         }
-        let mut spool = sheet
-            .spool
-            .take()
-            .context("Row spool missing")?
-            .into_inner()
-            .map_err(|e| e.into_error())?;
-        spool.as_file_mut().seek(SeekFrom::Start(0))?;
-        let zip = self.zip.as_mut().context("Writer finalized")?;
+        let name = sheet.name.clone();
         let index = self.names.len() + 1;
-        zip.start_file(
-            format!("xl/worksheets/sheet{index}.xml"),
-            compression_options(self.compression),
-        )?;
-        write!(
-            zip,
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{}">"#,
-            xml::SHEET_NS
-        )?;
-        let reference = if sheet.last_row == 0 || sheet.max_col == 0 {
-            "A1".to_owned()
+        let level = self.compression;
+        let zip = self.zip.as_mut().context("Writer finalized")?;
+        if let Some(compressor) = &mut self.compressor {
+            compressor.submit(zip, move |part| {
+                encode_sheet_part(part, sheet, ids, index, level)?;
+                Ok(None)
+            })?;
         } else {
-            format!(
-                "A1:{}{}",
-                crate::col_idx_to_letters(sheet.max_col - 1),
-                sheet.last_row
-            )
-        };
-        write!(zip, r#"<dimension ref="{reference}"/>"#)?;
-        if !sheet.formats.is_empty() || !sheet.widths.is_empty() {
-            zip.write_all(b"<cols>")?;
-            let columns: std::collections::BTreeSet<_> = sheet
-                .formats
-                .keys()
-                .chain(sheet.widths.keys())
-                .copied()
-                .collect();
-            for column in columns {
-                let index = column + 1;
-                let style = ids.get(&column).copied().unwrap_or(0);
-                let width = sheet.widths.get(&column).copied().unwrap_or(8.43);
-                write!(
-                    zip,
-                    r#"<col min="{index}" max="{index}" width="{width}" customWidth="1" style="{style}"/>"#
-                )?;
-            }
-            zip.write_all(b"</cols>")?;
+            encode_sheet_part(zip, sheet, ids, index, level)?;
         }
-        zip.write_all(b"<sheetData>")?;
-        let mut reader = BufReader::with_capacity(64 * 1024, spool);
-        loop {
-            let mut header = [0u8; 8];
-            let read = reader.read(&mut header[..1])?;
-            if read == 0 {
-                break;
-            }
-            reader.read_exact(&mut header[1..])?;
-            let row = u32::from_le_bytes(header[0..4].try_into()?);
-            let col = u16::from_le_bytes(header[4..6].try_into()?) as usize;
-            let length = u16::from_le_bytes(header[6..8].try_into()?) as usize;
-            write!(zip, r#"<row r="{row}">"#)?;
-            for offset in 0..length {
-                let value = decode_cell(&mut reader)?;
-                let column = col + offset;
-                let address = format!("{}{}", crate::col_idx_to_letters(column), row);
-                let sid = ids.get(&column).copied().filter(|id| *id != 0);
-                zip.write_all(&data::build_typed_cell_xml(&address, &value, sid)?)?;
-            }
-            zip.write_all(b"</row>")?;
-        }
-        zip.write_all(b"</sheetData></worksheet>")?;
-        self.names.push(sheet.name);
+        self.names.push(name);
         Ok(())
     }
     fn finalize(&mut self) -> Result<()> {
@@ -370,6 +334,9 @@ impl WorkbookWriter {
         self.seal_sheet()?;
         let result = (|| -> Result<NamedTempFile> {
             let zip = self.zip.as_mut().context("Writer finalized")?;
+            if let Some(compressor) = self.compressor.take() {
+                compressor.finish(zip)?;
+            }
             let mut sheets = String::new();
             let mut rels = String::new();
             let mut overrides = String::new();
@@ -459,6 +426,7 @@ impl WorkbookWriter {
         Ok(())
     }
     pub fn abort(&mut self) {
+        self.compressor = None;
         self.active = None;
         self.zip = None;
         self.completed = None;
@@ -495,4 +463,85 @@ fn decode_cell(reader: &mut impl Read) -> Result<CellValue> {
         4 => CellValue::Formula(text),
         _ => anyhow::bail!("Invalid row spool cell type"),
     })
+}
+
+fn encode_sheet_part<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    mut sheet: Sheet,
+    ids: BTreeMap<usize, u32>,
+    index: usize,
+    level: u8,
+) -> Result<()> {
+    let mut spool = sheet
+        .spool
+        .take()
+        .context("Row spool missing")?
+        .into_inner()
+        .map_err(|e| e.into_error())?;
+    spool.as_file_mut().seek(SeekFrom::Start(0))?;
+    zip.start_file(
+        format!("xl/worksheets/sheet{index}.xml"),
+        compression_options(level),
+    )?;
+    let mut buffered = BufWriter::with_capacity(256 * 1024, zip);
+    let zip = &mut buffered;
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{}">"#,
+        xml::SHEET_NS
+    )?;
+    let reference = if sheet.last_row == 0 || sheet.max_col == 0 {
+        "A1".to_owned()
+    } else {
+        format!(
+            "A1:{}{}",
+            crate::col_idx_to_letters(sheet.max_col - 1),
+            sheet.last_row
+        )
+    };
+    write!(zip, r#"<dimension ref="{reference}"/>"#)?;
+    if !sheet.formats.is_empty() || !sheet.widths.is_empty() {
+        zip.write_all(b"<cols>")?;
+        let columns: std::collections::BTreeSet<_> = sheet
+            .formats
+            .keys()
+            .chain(sheet.widths.keys())
+            .copied()
+            .collect();
+        for column in columns {
+            let index = column + 1;
+            let style = ids.get(&column).copied().unwrap_or(0);
+            let width = sheet.widths.get(&column).copied().unwrap_or(8.43);
+            write!(
+                zip,
+                r#"<col min="{index}" max="{index}" width="{width}" customWidth="1" style="{style}"/>"#
+            )?;
+        }
+        zip.write_all(b"</cols>")?;
+    }
+    zip.write_all(b"<sheetData>")?;
+    let mut reader = BufReader::with_capacity(64 * 1024, spool);
+    loop {
+        let mut header = [0u8; 8];
+        let read = reader.read(&mut header[..1])?;
+        if read == 0 {
+            break;
+        }
+        reader.read_exact(&mut header[1..])?;
+        let row = u32::from_le_bytes(header[0..4].try_into()?);
+        let col = u16::from_le_bytes(header[4..6].try_into()?) as usize;
+        let length = u16::from_le_bytes(header[6..8].try_into()?) as usize;
+        write!(zip, r#"<row r="{row}">"#)?;
+        for offset in 0..length {
+            let value = decode_cell(&mut reader)?;
+            let column = col + offset;
+            let address = format!("{}{}", crate::col_idx_to_letters(column), row);
+            let sid = ids.get(&column).copied().filter(|id| *id != 0);
+            zip.write_all(&data::build_typed_cell_xml(&address, &value, sid)?)?;
+        }
+        zip.write_all(b"</row>")?;
+    }
+    zip.write_all(b"</sheetData></worksheet>")?;
+    buffered.flush()?;
+    Ok(())
 }

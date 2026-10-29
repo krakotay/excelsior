@@ -4,6 +4,7 @@
 // static GLOBAL: MiMalloc = MiMalloc;
 mod archive;
 pub mod data;
+mod parallel;
 mod rows;
 mod shared;
 mod xml;

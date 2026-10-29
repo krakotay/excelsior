@@ -70,6 +70,34 @@ def _excel_value(value: Any, date_1904: bool) -> tuple[tuple[int, str], str | No
     return (1, str(value)), "@"
 
 
+def _dtype_converter(dtype: Any, date_1904: bool):
+    """Choose once per column; retain scalar conversion for unusual objects."""
+    name = str(dtype).split("(", 1)[0]
+    def generic(value):
+        return _excel_value(value, date_1904)[0]
+    if name in {"String", "Utf8", "Categorical", "Enum"}:
+        def text(value):
+            if value is None:
+                return (0, "")
+            return (1, value) if isinstance(value, str) else generic(value)
+        return text
+    if name.startswith("Float"):
+        def number(value):
+            if value is None:
+                return (0, "")
+            # Raw finite floats are formatted by Rust outside the GIL. Other
+            # values keep the scalar adapter's spelling and conversion rules.
+            return (5, value) if isinstance(value, float) and isfinite(value) else generic(value)
+        return number
+    if name.startswith(("Int", "UInt")):
+        def integer(value):
+            if value is None:
+                return (0, "")
+            return (2, str(value)) if type(value) is int else generic(value)
+        return integer
+    return generic
+
+
 class Editor:
     """XLSX editor with two explicit method contracts.
 
@@ -175,9 +203,9 @@ class Editor:
     def last_rows_index(self, col_name: str) -> list[int]:
         return self._native.last_rows_index(col_name)
 
-    def save(self, path: str | PathLike[str] | None = None, *, compression_level: int = 3) -> None:
-        """Save to the original path, or write a copy without changing that path."""
-        self._native.save(path, compression_level=compression_level)
+    def save(self, path: str | PathLike[str] | None = None, *, compression_level: int = 3, compression_threads: int = 1) -> None:
+        """Save atomically; compression_threads compresses ZIP members in parallel."""
+        self._native.save(path, compression_level=compression_level, compression_threads=compression_threads)
 
     def with_polars(self, py_df: Any, start_cell: str | None = None, *, force_column_formats: bool = True) -> None:
         """Mutate this worksheet with typed headers/rows from a dataframe.
@@ -239,6 +267,8 @@ def _prepare_frame(py_df: Any, start_cell: str | None, date_1904: bool):
     if len(formats) != len(columns):
         raise ValueError("DataFrame dtype count does not match its columns")
 
+    converters = [_dtype_converter(dtype, date_1904) for dtype in dtypes] if dtypes is not None else None
+
     def rows():
         yield [(1, str(column)) for column in columns]
         for offset, row in enumerate(py_df.iter_rows(), start=1):
@@ -246,13 +276,16 @@ def _prepare_frame(py_df: Any, start_cell: str | None, date_1904: bool):
                 raise ValueError("DataFrame exceeds XLSX row limit (including header)")
             if len(row) != len(columns):
                 raise ValueError("DataFrame row width does not match its columns")
-            values = []
-            for index, value in enumerate(row):
-                cell, fmt = _excel_value(value, date_1904)
-                values.append(cell)
-                if dtypes is None and fmt is not None:
-                    formats[index] = fmt
-            yield values
+            if converters is not None:
+                yield [convert(value) for convert, value in zip(converters, row)]
+            else:
+                values = []
+                for index, value in enumerate(row):
+                    cell, fmt = _excel_value(value, date_1904)
+                    values.append(cell)
+                    if fmt is not None:
+                        formats[index] = fmt
+                yield values
 
     return f"{letters.upper()}{start_row}", formats, rows()
 

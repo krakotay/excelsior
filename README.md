@@ -250,3 +250,60 @@ An open editor can still save if its original path has been removed.
 
 Local before/after measurements and remaining performance limits are recorded
 in [docs/performance-015.md](https://github.com/krakotay/excelsior/blob/master/docs/performance-015.md).
+
+
+## Parallel exports and ZIP compression (0.15.1)
+
+Independent workbooks can be written from Python threads. The adapter selects
+value converters once per dataframe dtype and hands bounded batches to Rust;
+XML generation, row spooling, float formatting, and saving run outside the GIL.
+Python iteration/conversion still uses the GIL, so scaling is workload-dependent.
+The package still imports neither Polars nor Arrow.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from excelsior import WorkbookWriter
+
+MAX_ROWS = 1_000_000
+output = Path("out")
+
+def export(item):
+    name, frame = item
+    with WorkbookWriter(output / f"{name}.xlsx", "Index",
+                        compression_level=1, compression_threads=2) as wb:
+        for i, offset in enumerate(range(0, max(1, frame.height), MAX_ROWS), 1):
+            if i > 1:
+                wb.add_worksheet(f"Sheet{i}")
+            wb.with_polars(frame.slice(offset, MAX_ROWS))
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    list(pool.map(export, files_list))
+```
+
+Each worker owns its workbook; dataframes are only read. WorkbookWriter keeps
+worksheet XML out of RAM, which is useful when several large files are written
+at once. No multiprocessing/pickling or additional dataframe copies are needed.
+Its compression workers can close previous sheets while subsequent rows are
+spooled. Exceptions from `pool.map` propagate to the caller.
+
+Editor can also be used in the worker, retaining its normal mutation contracts:
+
+```python
+wb = Editor.create("out/report.xlsx", "Index")
+# wb.with_polars(...); wb = wb.add_worksheet(...)
+wb.save(compression_level=1, compression_threads=4)
+```
+
+`compression_threads` must be positive and defaults to 1. Each worksheet is a
+separate ZIP member, so several sheets can compress concurrently. One member's
+Deflate stream is not split across threads; a one-sheet workbook generally
+benefits from exporting independent files in parallel instead. Combining many
+file workers and compression workers does not guarantee extra speed.
+Parallel compression uses a bounded queue and temporary files beside the output,
+without buffering full compressed worksheets in RAM. Atomic replacement and
+cleanup on success/error/abort apply to both sequential and parallel modes.
+
+`Editor.create` is a classmethod: calling `origin.create(...)` creates a new
+book rather than copying `origin` or inheriting its sheet name. Pass `"Index"`
+explicitly as shown above; a separate blank.xlsx is unnecessary for this export.

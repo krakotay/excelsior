@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.15.1
+
+- Convert dataframe values with converters selected once per dtype; pass finite
+  floats as numbers and format them in Rust without changing their cell types.
+- Process bounded row batches with native XML/spool work outside the GIL so
+  independent workbooks can be exported from Python threads.
+- Add optional `compression_threads` (default 1) to Editor.save and
+  WorkbookWriter construction. Compress independent ZIP members concurrently
+  using temporary files and copy compressed bytes into the final ZIP in order.
+- Buffer streaming worksheet output before compression to avoid tiny writes
+  to the compressor for every cell.
+- Preserve whole-call iterator rollback and exception order across batches;
+  join workers and remove their temporary files on save, error, and abort.
+
 ## 0.15.0
 
 - Share Editor XML, caches, and dimensions with Arc/copy-on-write; retain an open

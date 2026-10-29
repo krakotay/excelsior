@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyIterator, PyTuple};
 use rust_core::style::{AlignSpec, HorizAlignment, VertAlignment};
 use rust_core::{XlsxEditor, scan};
 use std::path::PathBuf;
@@ -129,37 +129,96 @@ fn create_excel(path: PathBuf, sheet_name: &str) -> PyResult<()> {
     rust_core::create_excel(&path, sheet_name).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-fn ingest_rows<F>(rows: &Bound<'_, PyAny>, write: F) -> PyResult<()>
+// Batches bound Python object lifetimes and let row serialization/compression
+// run outside the GIL. No Polars or Arrow objects cross the native boundary.
+enum InputCell {
+    Value(rust_core::data::CellValue),
+    Float(f64),
+}
+impl FromPyObject<'_, '_> for InputCell {
+    type Error = PyErr;
+    fn extract(cell: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        use rust_core::data::CellValue;
+        let cell = cell.cast::<PyTuple>()?;
+        if cell.len() != 2 {
+            return Err(PyValueError::new_err("Expected a tagged cell pair"));
+        }
+        let kind: u8 = cell.get_borrowed_item(0)?.extract()?;
+        let value = cell.get_borrowed_item(1)?;
+        Ok(match kind {
+            0 => InputCell::Value(CellValue::Blank),
+            1 => InputCell::Value(CellValue::Text(value.extract()?)),
+            2 => InputCell::Value(CellValue::Number(value.extract()?)),
+            3 => InputCell::Value(CellValue::Boolean(value.extract::<String>()? == "1")),
+            5 => InputCell::Float(value.extract()?),
+            _ => return Err(PyValueError::new_err("Unknown cell type")),
+        })
+    }
+}
+fn ingest_rows<F>(py: Python<'_>, rows: &Bound<'_, PyAny>, write: F) -> PyResult<()>
 where
     F: FnOnce(
-        &mut dyn Iterator<Item = anyhow::Result<Vec<rust_core::data::CellValue>>>,
-    ) -> anyhow::Result<()>,
+            &mut dyn Iterator<Item = anyhow::Result<Vec<rust_core::data::CellValue>>>,
+        ) -> anyhow::Result<()>
+        + Send,
 {
-    use rust_core::data::CellValue;
-    let iterator = rows.try_iter()?;
+    let iterator: Py<PyIterator> = rows.try_iter()?.unbind();
     let mut python_error = None;
-    let mut converted = iterator.map(|item| {
-        let values = item.and_then(|row| row.extract::<Vec<(u8, String)>>());
-        match values {
-            Ok(values) => values
-                .into_iter()
-                .map(|(kind, value)| {
-                    Ok(match kind {
-                        0 => CellValue::Blank,
-                        1 => CellValue::Text(value),
-                        2 => CellValue::Number(value),
-                        3 => CellValue::Boolean(value == "1"),
-                        _ => anyhow::bail!("Unknown cell type"),
-                    })
-                })
-                .collect(),
-            Err(error) => {
-                python_error = Some(error);
-                Err(anyhow::anyhow!("Data row conversion failed"))
+    let result = py.detach(|| {
+        let mut batch = Vec::new().into_iter();
+        let mut done = false;
+        let mut converted = std::iter::from_fn(|| {
+            if batch.len() == 0 && !done {
+                let next = Python::attach(|py| {
+                    let mut values = Vec::with_capacity(256);
+                    let mut cells = 0;
+                    let mut iterator = iterator.bind(py).clone();
+                    for _ in 0..256 {
+                        match iterator.next() {
+                            Some(item) => {
+                                match item.and_then(|row| row.extract::<Vec<InputCell>>()) {
+                                    Ok(row) => {
+                                        cells += row.len();
+                                        values.push(Ok(row));
+                                        if cells >= 16_384 {
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        values.push(Err(error));
+                                        done = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                done = true;
+                                break;
+                            }
+                        }
+                    }
+                    values
+                });
+                batch = next.into_iter();
             }
-        }
+            batch.next().map(|row| match row {
+                Ok(row) => Ok(row
+                    .into_iter()
+                    .map(|cell| match cell {
+                        InputCell::Value(value) => value,
+                        InputCell::Float(value) => {
+                            rust_core::data::CellValue::Number(format!("{value:?}"))
+                        }
+                    })
+                    .collect()),
+                Err(error) => {
+                    python_error = Some(error);
+                    Err(anyhow::anyhow!("Data row conversion failed"))
+                }
+            })
+        });
+        write(&mut converted)
     });
-    let result = write(&mut converted);
     if let Some(error) = python_error {
         return Err(error);
     }
@@ -172,6 +231,15 @@ fn compression_level(level: i32) -> PyResult<u8> {
         ));
     }
     Ok(level as u8)
+}
+
+fn compression_threads(threads: i32) -> PyResult<usize> {
+    if threads < 1 {
+        return Err(PyValueError::new_err(
+            "compression_threads must be positive",
+        ));
+    }
+    Ok(threads as usize)
 }
 
 #[pyclass(subclass)]
@@ -217,13 +285,23 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    fn write_typed_rows(&mut self, start: &str, rows: &Bound<'_, PyAny>) -> PyResult<()> {
-        ingest_rows(rows, |rows| self.editor.write_typed_table_at(start, rows))
+    fn write_typed_rows(
+        &mut self,
+        py: Python<'_>,
+        start: &str,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        ingest_rows(py, rows, |rows| {
+            self.editor.write_typed_table_at(start, rows)
+        })
     }
 
-    fn force_column_formats(&mut self, formats: Vec<(usize, String)>) -> PyResult<()> {
-        self.editor
-            .force_column_formats(&formats)
+    fn force_column_formats(
+        &mut self,
+        py: Python<'_>,
+        formats: Vec<(usize, String)>,
+    ) -> PyResult<()> {
+        py.detach(|| self.editor.force_column_formats(&formats))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -298,22 +376,24 @@ impl Editor {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    #[pyo3(signature = (path = None, *, compression_level = 3))]
+    #[pyo3(signature = (path = None, *, compression_level = 3, compression_threads = 1))]
     fn save(
         &mut self,
         py: Python<'_>,
         path: Option<PathBuf>,
         compression_level: i32,
+        compression_threads: i32,
     ) -> PyResult<()> {
         if !(0..=9).contains(&compression_level) {
             return Err(PyValueError::new_err(
                 "compression_level must be between 0 and 9",
             ));
         }
+        let threads = crate::compression_threads(compression_threads)?;
         let destination = path.unwrap_or_else(|| self.editor.source_path().to_path_buf());
         py.detach(|| {
             self.editor
-                .save_with_compression(destination, compression_level as u8)
+                .save_with_options(destination, compression_level as u8, threads)
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
@@ -437,13 +517,19 @@ struct WorkbookWriter {
 #[pymethods]
 impl WorkbookWriter {
     #[new]
-    #[pyo3(signature=(path,sheet_name="Sheet1",*,compression_level=3))]
-    fn new(path: PathBuf, sheet_name: &str, compression_level: i32) -> PyResult<Self> {
+    #[pyo3(signature=(path,sheet_name="Sheet1",*,compression_level=3,compression_threads=1))]
+    fn new(
+        path: PathBuf,
+        sheet_name: &str,
+        compression_level: i32,
+        compression_threads: i32,
+    ) -> PyResult<Self> {
         Ok(Self {
-            writer: rust_core::WorkbookWriter::create(
+            writer: rust_core::WorkbookWriter::create_with_options(
                 path,
                 sheet_name,
                 crate::compression_level(compression_level)?,
+                crate::compression_threads(compression_threads)?,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         })
@@ -457,8 +543,13 @@ impl WorkbookWriter {
         py.detach(|| self.writer.add_worksheet(sheet_name))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
-    fn write_typed_rows(&mut self, start: &str, rows: &Bound<'_, PyAny>) -> PyResult<()> {
-        ingest_rows(rows, |rows| self.writer.write_typed_rows(start, rows))
+    fn write_typed_rows(
+        &mut self,
+        py: Python<'_>,
+        start: &str,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        ingest_rows(py, rows, |rows| self.writer.write_typed_rows(start, rows))
     }
     fn force_column_formats(&mut self, formats: Vec<(usize, String)>) -> PyResult<()> {
         for (col, format) in formats {
@@ -490,8 +581,8 @@ impl WorkbookWriter {
         py.detach(|| self.writer.save(path.as_deref()))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
-    fn abort(&mut self) {
-        self.writer.abort();
+    fn abort(&mut self, py: Python<'_>) {
+        py.detach(|| self.writer.abort());
     }
 }
 
