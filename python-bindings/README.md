@@ -175,7 +175,10 @@ saving time. On `WorkbookWriter` choose the level in its constructor, because
 worksheets are compressed before the final `save()` call.
 
 Editor snapshots share their XML buffers, caches, dimension metadata, and the
-original open ZIP source. Each branch has an independent ZIP cursor. Atomic
+disk-backed ZIP source. On Windows the source is copied to a temporary file
+once when opened, because an open destination prevents atomic replacement;
+branches share that disk copy. Unix retains the original open file. Each branch
+has an independent ZIP cursor. Atomic
 saving by one branch does not replace the source read by the other branches.
 An open editor can still save if its original path has been removed.
 

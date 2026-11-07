@@ -1,5 +1,6 @@
-//! Independent ZIP cursors sharing the same open source file. Atomic saves keep
-//! that original file alive for all Editor branches without copying it into RAM.
+//! Independent ZIP cursors sharing a disk-backed source snapshot. Unix keeps the
+//! original file open; Windows uses a temporary copy so MoveFileEx can replace
+//! the original path while Editor branches retain their original archive.
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
@@ -16,6 +17,18 @@ impl Source {
         Self::from_file(File::open(path)?)
     }
     pub fn from_file(file: File) -> io::Result<Self> {
+        #[cfg(windows)]
+        let file = {
+            // MoveFileEx cannot replace an open destination, even when its
+            // handles allow delete sharing. Do not hold a published path open.
+            // A disk snapshot also retains lazy ZIP parts across branch saves
+            // without buffering the workbook in memory or copying each branch.
+            let mut original = file;
+            original.rewind()?;
+            let mut snapshot = tempfile::tempfile()?;
+            io::copy(&mut original, &mut snapshot)?;
+            snapshot
+        };
         let length = file.metadata()?.len();
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
@@ -27,6 +40,37 @@ impl Source {
             source: self.clone(),
             position: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readers_keep_snapshot_after_atomic_replacement() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("source.xlsx");
+        std::fs::write(&path, b"original archive")?;
+        let source = Source::open(&path)?;
+        let branch = source.clone();
+        let mut cursor = branch.reader();
+        cursor.seek(SeekFrom::Start(9))?;
+        let mut replacement = tempfile::NamedTempFile::new_in(directory.path())?;
+        std::io::Write::write_all(&mut replacement, b"replacement archive")?;
+        let published = replacement.persist(&path).map_err(|e| e.error)?;
+        let published = Source::from_file(published)?;
+        let mut original = String::new();
+        source.reader().read_to_string(&mut original)?;
+        assert_eq!(original, "original archive");
+        let mut remainder = String::new();
+        cursor.read_to_string(&mut remainder)?;
+        assert_eq!(remainder, "archive");
+        let mut current = String::new();
+        published.reader().read_to_string(&mut current)?;
+        assert_eq!(current, "replacement archive");
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 }
 pub(crate) struct Cursor {
